@@ -11,7 +11,18 @@ import logging
 import uuid
 from dataclasses import asdict, dataclass, field
 
+from app.broker.noren_client import PaperMode
+
 log = logging.getLogger("execution")
+
+
+class OrderNotSubmitted(RuntimeError):
+    """The order was refused BEFORE it could reach the broker.
+
+    This is a policy decision (paper mode, not armed, kill switch, missing
+    session), never an ambiguous network state, so the engine must NOT leave a
+    reconciliation marker behind for it.
+    """
 
 
 @dataclass
@@ -74,8 +85,16 @@ class ExecutionEngine:
                      ref_price, reason)
             return fill
 
-        # Live path: place, then confirm via the response; on any ambiguity the
-        # tag is left in _pending for reconciliation and NO retry is issued.
+        # Live path: a policy refusal must never be mistaken for an ambiguous
+        # submission. Check the gates BEFORE touching the broker, so a refusal
+        # raises cleanly and leaves _pending empty.
+        if not getattr(self.client, "live_armed", False):
+            raise OrderNotSubmitted(
+                f"live order refused: client not armed for live trading "
+                f"(paper_mode={self.paper_mode})"
+            )
+
+        # Only exceptions at/after this point mean "the request may have left".
         try:
             resp = self.client.place_order(
                 buy_or_sell="B" if action == "BUY" else "S",
@@ -84,6 +103,9 @@ class ExecutionEngine:
                 quantity=qty, price_type="MKT", price=0,
                 trigger_price=0, remarks=tag,
             )
+        except PaperMode as e:
+            # Client refused deterministically before sending - not ambiguous.
+            raise OrderNotSubmitted(str(e)) from e
         except Exception as e:  # ambiguous: order may exist at the broker
             self._pending[tag] = {"action": action, "strike": strike,
                                   "right": right, "error": str(e)}

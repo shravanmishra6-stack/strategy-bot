@@ -5,7 +5,7 @@ import pytest
 
 from app.broker.instruments import expiry_from_symbol, pick_nearest_expiry
 from app.data.bars import MinuteBarBuilder
-from app.execution.engine import ExecutionEngine
+from app.execution.engine import ExecutionEngine, OrderNotSubmitted
 from app.risk.manager import RiskManager
 from app.strategy.legs import SL, SoldLeg
 from app.strategy.live import LegInstrument, LiveStraddle
@@ -105,6 +105,47 @@ def test_live_engine_refuses_without_armed_client():
             raise AssertionError("must not be called")
 
     eng = ExecutionEngine(client=NotArmed(), paper_mode=False)
+    with pytest.raises(OrderNotSubmitted):
+        eng.sell_to_open(right="CE", strike=25000, qty=50, ref_price=100.0,
+                         symbol="NIFTY26J15CE25000")
+    # A refusal must not masquerade as an ambiguous submission.
+    assert eng.pending_count() == 0
+    assert eng.fills == []
+
+
+def test_not_armed_papermode_exception_is_not_ambiguous():
+    """Client that claims armed but then refuses with PaperMode."""
+    from app.broker.noren_client import PaperMode
+
+    class Conflicting:
+        live_armed = True
+
+        def place_order(self, **kw):
+            raise PaperMode("REFUSED: kill switch on")
+
+    eng = ExecutionEngine(client=Conflicting(), paper_mode=False)
+    with pytest.raises(OrderNotSubmitted):
+        eng.buy_to_close(right="PE", strike=25000, qty=50, ref_price=90.0,
+                         reason="SQUAREOFF")
+    assert eng.pending_count() == 0
+
+
+def test_transport_failure_is_ambiguous_and_reconciles():
+    class Flaky:
+        live_armed = True
+
+        def place_order(self, **kw):
+            raise TimeoutError("no response - order may exist")
+
+        def get_order_book(self):
+            return [{"rk": None}]
+
+    eng = ExecutionEngine(client=Flaky(), paper_mode=False)
+    with pytest.raises(TimeoutError):
+        eng.sell_to_open(right="CE", strike=25000, qty=50, ref_price=100.0)
+    assert eng.pending_count() == 1          # genuinely ambiguous -> tracked
+    assert eng.reconcile() == []             # no tag match yet -> still pending
+    assert eng.pending_count() == 1
 
 
 # --- live straddle -------------------------------------------------------------
