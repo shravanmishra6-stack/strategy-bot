@@ -1,0 +1,18 @@
+# Shoonya (Noren OMS) OAuth client — importable as NorenRestApiPy.NorenApi
+NorenRestApiOAuth==0.0.41
+
+# API layer
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+pydantic==2.8.2
+
+# Data / maths
+pandas>=2.2
+numpy>=1.26
+
+# Config
+python-dotenv>=1.0
+
+# Tests
+pytest>=8.0
+httpx>=0.27

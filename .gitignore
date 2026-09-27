@@ -1,0 +1,36 @@
+# --- secrets: never commit these -------------------------------------------
+.env
+.env.*
+!.env.example
+cred.yml
+*.pem
+*.key
+
+# --- python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# --- local state / data -----------------------------------------------------
+*.db
+*.sqlite3
+*.log
+runtime/
+
+# --- scratch / one-off probe output -----------------------------------------
+*_out.txt
+parity_*.txt
+
+# --- node / dashboard -------------------------------------------------------
+node_modules/
+dashboard/dist/
+.vite/
+
+# --- trading artefacts ------------------------------------------------------
+orders.csv
+trades.csv
+equity_curve.csv
