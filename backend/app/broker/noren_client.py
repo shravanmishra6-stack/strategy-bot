@@ -59,9 +59,21 @@ class RateLimiter:
 
 
 def _unwrap(resp, *, context: str):
-    """Normalise Noren responses: dict/list/None -> value or raise."""
+    """Normalise Noren responses: dict/list/None -> value or raise.
+
+    NB: the vendored SDK converts any ``stat != Ok`` (dict) response into a bare
+    ``None`` for its list-flavoured getters, so a ``None`` here usually means the
+    broker rejected the call (bad segment/args, empty book, or a dead session)
+    and we cannot see the ``emsg``. Callers that treat an empty list as valid
+    pass ``empty_on_none`` on the wrapper method and enable DEBUG logging on the
+    ``NorenRestApiPy.NorenApi`` logger to surface the real reason.
+    """
     if resp is None:
-        raise BrokerError(f"{context}: empty response (check logs/session)")
+        raise BrokerError(
+            f"{context}: broker returned nothing (Not_Ok / empty). "
+            f"Check the segment + arguments; enable DEBUG on "
+            f"'NorenRestApiPy.NorenApi' to see the broker emsg.",
+        )
     if isinstance(resp, dict):
         stat = str(resp.get("stat", "")).lower()
         emsg = str(resp.get("emsg", "")) or None
@@ -73,12 +85,17 @@ def _unwrap(resp, *, context: str):
             raise BrokerError(f"{context}: {emsg or 'Not_Ok'}", emsg=emsg)
         return resp
     if isinstance(resp, list):
+        # A list of one error dict is a disguised Not_Ok; anything else (rows,
+        # including an empty list) is a legitimate payload. The SDK returns the
+        # parsed JSON list verbatim for books/positions, so do NOT drop it.
         if (
             len(resp) == 1
             and isinstance(resp[0], dict)
             and str(resp[0].get("stat", "")).lower() not in ("", "ok")
         ):
             return _unwrap(resp[0], context=context)
+        return resp
+    return resp
 
 
 class ShoonyaClient:
@@ -152,7 +169,15 @@ class ShoonyaClient:
         log.info("Live trading disarmed (paper only).")
 
     # --- generic call wrapper ----------------------------------------------
-    def _call(self, method_name: str, *args, retries: int = 0, **kwargs):
+    def _call(self, method_name: str, *args, retries: int = 0,
+              empty_on_none: bool = False, **kwargs):
+        """Invoke an SDK method and unwrap it.
+
+        empty_on_none: treat the SDK's ``None`` (which it returns both for a
+        genuinely empty book AND for a Not_Ok it couldn't parse as a list) as an
+        empty result instead of raising. Safe for read-only books where "no
+        rows" is a normal state; never use it on trading calls.
+        """
         if not self.session_ok:
             raise BrokerError("Broker session not established")
         func = getattr(self._api, method_name)
@@ -165,6 +190,12 @@ class ShoonyaClient:
                 self._session_ok = False  # never retry an auth-dead session
                 raise
             except BrokerError as e:
+                if empty_on_none:
+                    # The SDK hides the broker's reason; say so in our log
+                    # rather than silently reporting an empty book.
+                    log.warning("%s returned nothing; treating as empty: %s",
+                                method_name, e)
+                    return []
                 last_err = e
                 # Never blindly retry place_order: a timeout may still have
                 # created the order. The engine reconciles via order book.
@@ -179,20 +210,20 @@ class ShoonyaClient:
         return self._call("get_limits", retries=2)
 
     def get_positions(self):
-        return self._call("get_positions", retries=1) or []
+        return self._call("get_positions", retries=1, empty_on_none=True) or []
 
     def get_order_book(self):
-        return self._call("get_order_book", retries=1) or []
+        return self._call("get_order_book", retries=1, empty_on_none=True) or []
 
     def get_trade_book(self):
-        return self._call("get_trade_book", retries=1) or []
+        return self._call("get_trade_book", retries=1, empty_on_none=True) or []
 
     def get_holdings(self):
-        return self._call("get_holdings", retries=1) or []
+        return self._call("get_holdings", retries=1, empty_on_none=True) or []
 
     # --- market data --------------------------------------------------------
-    def searchscrip(self, exchange: str, searchtext: str):
-        return self._call("searchscrip", exchange, searchtext, retries=2)
+    def searchscrip(self, exchange: str, searchtext: str, *, retries: int = 2):
+        return self._call("searchscrip", exchange, searchtext, retries=retries)
 
     def get_security_info(self, exchange: str, token: str):
         return self._call("get_security_info", exchange, token, retries=2)

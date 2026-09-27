@@ -87,6 +87,39 @@ class Settings:
         )
     )
 
+    # --- Broker identities discovered from the LIVE API (read-only probes) -----
+    # These were NOT guessed: 'NSE_FNO' is rejected by this account with
+    # 404 "Exchange Not enabled", while 'NFO' returns NIFTY option scrips.
+    # Likewise the NIFTY spot index quotes on exchange NSE under token 26000
+    # ("Nifty 50"); the legacy token '13' returns no data.
+    fno_exchange: str = field(
+        default_factory=lambda: os.getenv("SHOONYA_FNO_EXCHANGE", "NFO")
+    )
+    index_exchange: str = field(
+        default_factory=lambda: os.getenv("SHOONYA_INDEX_EXCHANGE", "NSE")
+    )
+    index_token: str = field(
+        default_factory=lambda: os.getenv("SHOONYA_INDEX_TOKEN", "26000")
+    )
+    root_symbol: str = field(
+        default_factory=lambda: os.getenv("SHOONYA_ROOT_SYMBOL", "NIFTY")
+    )
+    # Weekdays (Mon=0..Sun=6) that can host a NIFTY weekly expiry. The live
+    # probe listed weeklies on 29-SEP, 06-OCT and 13-OCT 2026 - all Tuesdays -
+    # with no Thursday/Friday contracts at all, so only Tuesday is probed.
+    # Override via SHOONYA_EXPIRY_WEEKDAYS (e.g. "1,3,4") if the exchange
+    # changes its weekly-expiry schedule.
+    expiry_weekdays: tuple[int, ...] = field(
+        default_factory=lambda: tuple(
+            int(x) for x in os.getenv("SHOONYA_EXPIRY_WEEKDAYS", "1").split(",")
+            if x.strip().lstrip("-").isdigit()
+        )
+    )
+    # Product type used for live option orders (M = MIS intraday).
+    product_type: str = field(
+        default_factory=lambda: os.getenv("SHOONYA_PRODUCT_TYPE", "M")
+    )
+
     # Historical data location (reused from the existing Breeze CSV dump)
     data_dir: Path = field(
         default_factory=lambda: Path(os.getenv("DATA_DIR", str(DEFAULT_DATA_DIR)))

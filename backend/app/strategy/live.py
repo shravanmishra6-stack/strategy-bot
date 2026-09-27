@@ -29,6 +29,11 @@ class LegInstrument:
     tradingsymbol: str
     strike: int
     right: str
+    # Broker-confirmed values, never guesses: NFO (not NSE_FNO) is the segment
+    # this account can trade, and lot_size is the exchange lot (live probe:
+    # ls=65 for NIFTY options). Order quantity = lots * lot_size.
+    exchange: str = "NFO"
+    lot_size: int | None = None
 
 
 @dataclass
@@ -45,9 +50,10 @@ class LiveStraddle:
     instruments: dict = field(default_factory=dict)  # right -> LegInstrument
     builders: dict = field(default_factory=dict)     # token -> MinuteBarBuilder
     last_price: dict = field(default_factory=dict)   # token -> float
-    entry_qty: int = 1
+    lots: int = 1                         # contracts in LOTS (risk-gated)
     errors: list = field(default_factory=list)
     _spot_token: str | None = None
+    _order_qty: dict = field(default_factory=dict)   # right -> validated qty
 
     def configure(self, *, spot_token: str,
                   legs: list[tuple[SoldLeg, LegInstrument]]):
@@ -57,6 +63,19 @@ class LiveStraddle:
             self.legs[leg.right] = leg
             self.instruments[inst.right] = inst
             self.builders[inst.token] = MinuteBarBuilder(on_bar=None)
+
+    # --- sizing ---------------------------------------------------------------
+    def _qty_for(self, inst: LegInstrument) -> int:
+        """Order quantity in shares: lots x the broker's lot size.
+
+        Raises if the lot size is unknown - sending qty=1 for a 65-share lot
+        would be a real, silent mispricing of the whole strategy.
+        """
+        lot = getattr(inst, "lot_size", None)
+        if not lot or int(lot) <= 0:
+            raise ValueError(
+                f"{inst.tradingsymbol}: no broker lot size - refusing to size order")
+        return int(self.lots) * int(lot)
 
     # --- tick fan-in ------------------------------------------------------
     def on_tick(self, ts: dt.datetime, token: str, price: float) -> None:
@@ -95,31 +114,42 @@ class LiveStraddle:
             log.error("%s", self.errors[-1])
             self.phase = "DONE"
             return
-        decision = self.risk.allow_entry(lots=self.entry_qty, now=ts)
+        decision = self.risk.allow_entry(lots=self.lots, now=ts)
         if not decision:
             log.warning("entry blocked by risk: %s", decision.reason)
             self.phase = "DONE"
             return
         priced = {}
         for right in ("CE", "PE"):
-            px = self.last_price.get(self.instruments[right].token)
+            inst = self.instruments[right]
+            px = self.last_price.get(inst.token)
             if px is None or px <= 0:
                 self.errors.append(f"no premium for {right}; aborting entry")
                 self.phase = "DONE"
                 return
+            try:
+                qty = self._qty_for(inst)
+            except ValueError as e:
+                # A wrong size is worse than no trade: sizing happens BEFORE
+                # anything is sent, so the day simply does not open.
+                self.errors.append(f"order size refused: {e}")
+                log.error("%s", self.errors[-1])
+                self.phase = "DONE"
+                return
             priced[right] = px
+            self._order_qty[right] = qty
         self.risk.record_entry()
         for right, px in priced.items():
             inst = self.instruments[right]
             self.exec_engine.sell_to_open(
-                right=right, strike=inst.strike, qty=self.entry_qty,
+                right=right, strike=inst.strike, qty=self._order_qty[right],
                 ref_price=px, token=inst.token, symbol=inst.tradingsymbol,
-                ts=ts,
+                exchange=inst.exchange, ts=ts,
             )
             self.legs[right].arm(px)
         self.phase = "IN_POSITION"
-        log.info("ENTERED straddle CE%d/PE%d @ %s", atm, want_pe,
-                 ts.strftime("%H:%M:%S"))
+        log.info("ENTERED straddle CE%d/PE%d x%s @ %s", atm, want_pe,
+                 dict(self._order_qty), ts.strftime("%H:%M:%S"))
 
     # --- exits ----------------------------------------------------------------
     def _on_leg_bar(self, token: str, bar) -> None:
@@ -134,9 +164,10 @@ class LiveStraddle:
             reason, fill = res
             inst = self.instruments[right]
             self.exec_engine.buy_to_close(
-                right=right, strike=inst.strike, qty=self.entry_qty,
+                right=right, strike=inst.strike,
+                qty=self._order_qty.get(right) or self._qty_for(inst),
                 ref_price=fill, reason=reason, token=inst.token,
-                symbol=inst.tradingsymbol, ts=self.now,
+                symbol=inst.tradingsymbol, exchange=inst.exchange, ts=self.now,
             )
             self._check_day_closed()
 
@@ -146,10 +177,13 @@ class LiveStraddle:
                 inst = self.instruments[right]
                 # Best available: last completed close, else last raw price.
                 px = leg.last_close or self.last_price.get(inst.token) or 0.0
+                # Reuse the quantity actually opened; never re-derive it here,
+                # or a sizing hiccup could leave the position stuck open.
                 self.exec_engine.buy_to_close(
-                    right=right, strike=inst.strike, qty=self.entry_qty,
+                    right=right, strike=inst.strike,
+                    qty=self._order_qty.get(right) or self._qty_for(inst),
                     ref_price=px, reason="SQUAREOFF", token=inst.token,
-                    symbol=inst.tradingsymbol, ts=ts,
+                    symbol=inst.tradingsymbol, exchange=inst.exchange, ts=ts,
                 )
                 leg.is_open = False
         self.phase = "DONE"
@@ -164,7 +198,14 @@ class LiveStraddle:
             "phase": self.phase,
             "date": str(self.date),
             "spot_ref": self.spot_ref,
+            "lots": self.lots,
+            "order_qty": dict(self._order_qty),
             "legs": {r: l.to_dict() for r, l in self.legs.items()},
+            "instruments": {
+                r: {"symbol": i.tradingsymbol, "token": i.token,
+                    "exchange": i.exchange, "lot_size": i.lot_size}
+                for r, i in self.instruments.items()
+            },
             "errors": self.errors[-5:],
         }
 
