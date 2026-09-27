@@ -65,9 +65,15 @@ class Settings:
     uid: str = field(default_factory=lambda: os.getenv("SHOONYA_UID", ""))
     account_id: str = field(default_factory=lambda: os.getenv("SHOONYA_ACCOUNT_ID", ""))
     access_token: str = field(default_factory=lambda: os.getenv("SHOONYA_ACCESS_TOKEN", ""))
+    # Browser OAuth page. Verified against Shoonya's own /OAuthlogin/ SPA
+    # (assets/Auth-*.js): the 'authorize' route is mounted at base
+    # '/OAuthlogin/' + '/authorize/oauth' and reads 'client_id' from the query
+    # string, which is exactly what NorenApi.getOAuthURL() appends. The
+    # 'NorenWeb/authorize/oauth' path found in the vendor sample cred.yml is
+    # stale and returns 404.
     oauth_url: str = field(
         default_factory=lambda: os.getenv(
-            "SHOONYA_OAUTH_URL", "https://api.shoonya.com/NorenWeb/authorize/oauth"
+            "SHOONYA_OAUTH_URL", "https://api.shoonya.com/OAuthlogin/authorize/oauth"
         )
     )
     host: str = field(

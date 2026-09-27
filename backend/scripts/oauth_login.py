@@ -65,9 +65,18 @@ def phase1_show_url() -> int:
         return 1
     url = api.getOAuthURL(settings.oauth_url, client_id)
     print("=" * 70)
-    print("PHASE 1 - authorise in your browser (already logged in to Shoonya web):\n")
-    print(url)
-    print("\nCopy the auth_code shown, then run:")
+    print("PHASE 1 - authorise in your browser\n")
+    print("1. FIRST log in to Shoonya web in the SAME browser, e.g.")
+    print("       https://trade.shoonya.com   (or https://beta.shoonya.com)")
+    print("   The authorize page needs that session cookie; if you are not")
+    print("   logged in it just bounces you to /investor-entry-level/login.")
+    print("\n2. Then open this URL:")
+    print("   " + url)
+    print("\n3. Approve. The browser is form-POSTed to .../NorenWClientAPI/")
+    print("   GetAuthCode and lands on a URL containing  code=<auth_code>")
+    print("   (if nothing visible shows, open DevTools -> Network and copy the")
+    print("   'code=' value). auth_codes are single-use and short-lived.")
+    print("\n4. Then run:")
     print(f'    python -m scripts.oauth_login --authcode "<auth_code>"')
     print("=" * 70)
     return 0
@@ -87,14 +96,28 @@ def phase2_exchange(auth_code: str, uid_override: str = "") -> int:
 
     print(f"Exchanging auth_code for access token (uid={uid}) ...")
     # SDK hashes sha256(client_id + secret + authcode) internally and injects
-    # the Bearer header on success. Returns a tuple, or None on failure.
-    result = api.getAccessToken(auth_code, secret, client_id, uid)
+    # the Bearer header on success. Returns a tuple, or None on failure - and
+    # can also *raise* (json.loads on an HTML error page, or a missing
+    # refresh_token/actid key), so guard the call and surface the broker emsg.
+    try:
+        result = api.getAccessToken(auth_code, secret, client_id, uid)
+    except Exception as e:
+        print(f"FAILED: token exchange raised {type(e).__name__}: {e}")
+        print("         Most likely the auth_code is expired/already used, or")
+        print("         client_id/secret_code/uid do not match. Re-run phase 1.")
+        return 2
     if not result:
         print("FAILED: token exchange rejected (auth_code expired/used, or bad creds).")
         print("         Re-run phase 1 to get a fresh auth_code.")
         return 2
+    if not isinstance(result, (tuple, list)) or len(result) != 4:
+        print("FAILED: unexpected getAccessToken() return:", repr(result))
+        return 2
 
     token, userid, refresh, actid = result
+    if not token:
+        print("FAILED: broker returned an empty access_token.")
+        return 2
     print("   token issued - validating with get_limits() ...")
     limits = api.get_limits()
     if not limits or str(limits.get("stat", "")).lower() not in ("", "ok"):

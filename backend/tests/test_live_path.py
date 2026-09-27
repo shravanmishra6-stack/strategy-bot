@@ -226,3 +226,78 @@ def test_live_refuses_entry_when_strike_mismatch():
     live.on_tick(ts(9, 20), "2", 100.0)
     live.on_tick(ts(9, 20, 1), "999", 25010.0)     # ATM would be 25000
     assert live.phase == "DONE" and eng.fills == []
+
+
+# --- OAuth login URL -------------------------------------------------------
+# Shoonya's own /OAuthlogin/ SPA (assets/Auth-*.js) reads client_id from the
+# query string, and the vendor sample's "NorenWeb/authorize/oauth" path 404s.
+# Pin the shape so the stale URL cannot creep back in.
+
+def test_oauth_url_is_the_live_authorize_page():
+    from app.config import settings
+
+    assert settings.oauth_url.startswith("https://api.shoonya.com/")
+    assert settings.oauth_url.endswith("/OAuthlogin/authorize/oauth")
+    assert "NorenWeb/authorize" not in settings.oauth_url
+
+
+def test_getoauth_url_appends_client_id():
+    from NorenRestApiPy.NorenApi import NorenApi
+
+    from app.config import settings
+
+    api = NorenApi(host=settings.host, websocket=settings.websocket)
+    url = api.getOAuthURL(settings.oauth_url, "CLIENT123")
+    assert url == settings.oauth_url + "?client_id=CLIENT123"
+
+
+def test_token_exchange_host_matches_oauth_host():
+    """GenAcsTok must sit on the same host as the authorize page, otherwise an
+    auth_code minted in the browser can never be redeemed."""
+    from urllib.parse import urlparse
+
+    from app.config import settings
+
+    assert urlparse(settings.oauth_url).netloc == urlparse(settings.host).netloc
+    assert settings.host.rstrip("/").endswith("NorenWClientAPI")
+
+
+def test_phase2_reports_broker_error_without_crashing(monkeypatch, capsys):
+    """getAccessToken() raises (HTML error page) instead of returning None."""
+    import scripts.oauth_login as ol
+
+    class BoomApi:
+        def getAccessToken(self, *a, **k):
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+    fake_settings = type("S", (), {
+        "client_id": "CID", "secret_code": "SEC", "uid": "UID"})()
+    monkeypatch.setattr(ol, "_make_api", lambda: (BoomApi(), fake_settings))
+    monkeypatch.setattr(ol, "_env_value", lambda name: "")
+
+    rc = ol.phase2_exchange("an-auth-code")
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "token exchange raised ValueError" in out
+    assert "auth_code is expired" in out
+
+
+def test_phase2_never_writes_env_on_rejection(monkeypatch):
+    import scripts.oauth_login as ol
+
+    written = {}
+    monkeypatch.setattr(
+        ol, "_write_env_values", lambda vals: written.update(vals))
+
+    class NullApi:
+        def getAccessToken(self, *a, **k):
+            return None
+
+    fake_settings = type("S", (), {
+        "client_id": "CID", "secret_code": "SEC", "uid": "UID"})()
+    monkeypatch.setattr(ol, "_make_api", lambda: (NullApi(), fake_settings))
+    monkeypatch.setattr(ol, "_env_value", lambda name: "")
+
+    assert ol.phase2_exchange("bad-code") == 2
+    assert written == {}
+
