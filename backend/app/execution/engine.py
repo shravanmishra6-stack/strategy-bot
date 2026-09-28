@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
 import uuid
 from dataclasses import asdict, dataclass, field
 
 from app.broker.noren_client import PaperMode
+from app.broker.noren_client import ALLOWED_LIVE_PRICE_TYPE, REJECTED_LIVE_PRICE_TYPES
 from app.config import settings
 
 log = logging.getLogger("execution")
@@ -23,6 +25,17 @@ class OrderNotSubmitted(RuntimeError):
     This is a policy decision (paper mode, not armed, kill switch, missing
     session, incomplete instrument), never an ambiguous network state, so the
     engine must NOT leave a reconciliation marker behind for it.
+    """
+
+
+class PermanentOrderRefusal(OrderNotSubmitted):
+    """A pre-send refusal that can NEVER succeed on retry.
+
+    "Client not armed" is retryable - the operator may arm a minute later. A
+    forbidden order type is not: the broker rejects it every single time, so
+    retrying it is exactly the hammer-the-broker-forever loop this fix exists
+    to stop. Subclasses OrderNotSubmitted so it still carries the "nothing was
+    sent, no reconcile marker" meaning.
     """
 
 
@@ -79,6 +92,33 @@ class ExecutionEngine:
                           exchange=exchange, reason=reason, ts=ts)
 
     # --- core ----------------------------------------------------------------
+    def _limit_price(self, action: str, ref_price: float) -> float:
+        """Marketable limit price for one order.
+
+        Shoonya rejects MKT for API orders ("ALGO_CHK: MKT Order type not
+        allowed for API order"), so every order is sent as a LIMIT priced
+        through the spread: a SELL is placed BELOW the reference so it crosses
+        the bid, a BUY ABOVE so it crosses the ask. The buffer is a config
+        percentage, so a quiet premium still gets a fill while a wild one
+        cannot fill more than that far away from the price the strategy
+        decided on - which also makes the fill reproducible in the backtest.
+
+        This is marketable-limit, not aggressive: at 0.5% on a 100-point
+        premium the limit is within ~0.50 of the reference, i.e. inside the
+        spread rather than through it.
+        """
+        pct = float(getattr(settings, "order_limit_buffer_pct", 0.5)) / 100.0
+        tick = float(getattr(settings, "order_tick_size", 0.05)) or 0.05
+        ref = float(ref_price)
+        raw = ref * (1.0 + pct) if action == "BUY" else ref * (1.0 - pct)
+        # Round DOWN/UP to the real tick and never past the reference: the
+        # float form of 0.05 must not round a SELL above ref_price.
+        steps = math.floor(raw / tick)
+        px = round(steps * tick, 2)
+        if ref > 0:
+            px = max(px, tick) if action == "BUY" else min(px, ref)
+        return px
+
     def _send(self, *, action: str, right: str, strike: int, qty: int,
               ref_price: float, token, symbol, reason: str, ts,
               exchange: str | None = None) -> Fill:
@@ -112,6 +152,19 @@ class ExecutionEngine:
                 f"(symbol={symbol!r} token={token!r}) - refusing to guess"
             )
         exch = exchange or settings.fno_exchange
+        limit_px = self._limit_price(action, ref_price)
+        price_type = ALLOWED_LIVE_PRICE_TYPE
+
+        # Last line of defence: if a future edit ever makes this send MKT, the
+        # order would be rejected by the broker every single poll - a silent,
+        # endless retry loop that looks like a quote problem on the dashboard.
+        # Refuse locally (still "not submitted", so no reconcile marker) rather
+        # than let a guaranteed-bad request leave the process.
+        if price_type.upper() in REJECTED_LIVE_PRICE_TYPES:
+            raise PermanentOrderRefusal(
+                f"live order refused: {price_type} is rejected for API orders "
+                f"by the broker (ALGO_CHK); a LIMIT is required"
+            )
 
         # Only exceptions at/after this point mean "the request may have left".
         try:
@@ -119,7 +172,7 @@ class ExecutionEngine:
                 buy_or_sell="B" if action == "BUY" else "S",
                 product_type=self.product_type, exchange=exch,
                 tradingsymbol=symbol,
-                quantity=qty, price_type="MKT", price=0,
+                quantity=qty, price_type=price_type, price=limit_px,
                 trigger_price=0, remarks=tag,
             )
         except PaperMode as e:

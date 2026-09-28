@@ -41,6 +41,16 @@ class PaperMode(RuntimeError):
     """Order refused because live trading is not armed - engine simulates fills."""
 
 
+# Shoonya refuses market orders for API-originated orders ("ALGO_CHK: MKT Order
+# type not allowed for API order"). Phone/MOB orders are exempt, so this only
+# ever bites the bot - and it bites silently, because the vendored SDK throws the
+# broker's `emsg` away and leaves a bare `None` behind. Every live order must be
+# a LIMIT priced through the spread; asking for MKT is a guaranteed rejection,
+# never a fill attempt.
+ALLOWED_LIVE_PRICE_TYPE = "LMT"
+REJECTED_LIVE_PRICE_TYPES = ("MKT", "SL-M", "SLM")
+
+
 class RateLimiter:
     """Minimum interval between outbound requests (thread safe)."""
 
@@ -142,6 +152,30 @@ class ShoonyaClient:
                 self._session_ok = False
                 log.error("Shoonya connect failed: %s", e)
                 raise BrokerError(f"connect failed: {e}") from e
+
+    def refresh_session(self, access_token: str, uid: str = "", account_id: str = "") -> bool:
+        """Inject new token into client session and validate immediately."""
+        with self._lock:
+            try:
+                from NorenRestApiPy.NorenApi import NorenApi
+            except ImportError as e:
+                raise BrokerError(f"NorenRestApiOAuth not installed: {e}")
+
+            api = NorenApi(host=self.cfg.host, websocket=self.cfg.websocket)
+            try:
+                actual_uid = uid or self.cfg.uid
+                actual_actid = account_id or self.cfg.account_id
+                api.injectOAuthHeader(access_token, actual_uid, actual_actid)
+                limits = _unwrap(api.get_limits(), context="refresh_session/get_limits")
+                self._api = api
+                self._session_ok = bool(limits)
+                log.info("Shoonya session refreshed and verified (uid=%s)", actual_uid)
+                return True
+            except Exception as e:
+                self._session_ok = False
+                log.error("Shoonya refresh_session failed: %s", e)
+                raise BrokerError(f"Token validation failed: {e}") from e
+
 
     @property
     def session_ok(self) -> bool:

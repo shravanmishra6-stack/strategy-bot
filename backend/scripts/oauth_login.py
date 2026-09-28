@@ -82,6 +82,54 @@ def phase1_show_url() -> int:
     return 0
 
 
+def exchange_and_save(auth_code: str, uid_override: str = "") -> dict:
+    """Exchange authcode for access token, update .env, and return details.
+    
+    Raises ValueError / RuntimeError on failure.
+    """
+    api, settings = _make_api()
+    client_id = settings.client_id or _env_value("SHOONYA_CLIENT_ID")
+    secret = settings.secret_code or _env_value("SHOONYA_SECRET_CODE")
+    uid = uid_override or settings.uid or _env_value("SHOONYA_UID") or client_id
+    if not client_id or not secret:
+        raise ValueError("SHOONYA_CLIENT_ID / SHOONYA_SECRET_CODE not configured in .env")
+    if not auth_code:
+        raise ValueError("No auth_code provided")
+
+    try:
+        result = api.getAccessToken(auth_code, secret, client_id, uid)
+    except Exception as e:
+        raise RuntimeError(f"Token exchange raised: {e}") from e
+
+    if not result or not isinstance(result, (tuple, list)) or len(result) != 4:
+        raise RuntimeError("Token exchange rejected by broker (code may be expired or already used)")
+
+    token, userid, refresh, actid = result
+    if not token:
+        raise RuntimeError("Broker returned empty access token")
+
+    limits = api.get_limits()
+    if not limits or str(limits.get("stat", "")).lower() not in ("", "ok"):
+        raise RuntimeError(f"Token validation failed via get_limits: {limits}")
+
+    actual_uid = userid or uid
+    actual_actid = actid or client_id
+    _write_env_values({
+        "SHOONYA_ACCESS_TOKEN": token,
+        "SHOONYA_UID": actual_uid,
+        "SHOONYA_ACCOUNT_ID": actual_actid,
+        "SHOONYA_REFRESH_TOKEN": refresh or "",
+    })
+
+    return {
+        "access_token": token,
+        "uid": actual_uid,
+        "account_id": actual_actid,
+        "refresh_token": refresh or "",
+    }
+
+
+
 def phase2_exchange(auth_code: str, uid_override: str = "") -> int:
     api, settings = _make_api()
     client_id = settings.client_id or _env_value("SHOONYA_CLIENT_ID")

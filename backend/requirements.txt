@@ -9,6 +9,9 @@ pydantic==2.8.2
 # Data / maths
 pandas>=2.2
 numpy>=1.26
+# Excel writer/reader for the daily trade journal (app/journal.py). pandas needs
+# it explicitly for xlsx - it is NOT a pandas hard dependency.
+openpyxl>=3.1
 
 # Config
 python-dotenv>=1.0

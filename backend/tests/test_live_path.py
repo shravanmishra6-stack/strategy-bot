@@ -183,6 +183,51 @@ def test_live_refuses_incomplete_instrument_without_touching_broker():
     assert eng.fills == []
 
 
+def test_api_orders_use_a_marketable_limit_never_mkt():
+    """Shoonya rejects MKT for API orders: 'Rejected : ALGO_CHK: MKT Order type
+    not allowed for API order' (live, 2026-09-28). Phone-app orders are exempt,
+    so this can only ever be caught by actually sending an order through the
+    API - the engine must price a LIMIT instead."""
+    sent = []
+
+    class Armed:
+        live_armed = True
+
+        def place_order(self, **kw):
+            sent.append(kw)
+            return {"stat": "Ok", "norenordno": "900005"}
+
+    eng = ExecutionEngine(client=Armed(), paper_mode=False)
+    eng.sell_to_open(right="CE", strike=25000, qty=65, ref_price=100.0,
+                     token="73927", symbol="NIFTY29SEP26C25000",
+                     exchange="NFO")
+    assert sent[0]["price_type"] == "LMT"
+    assert sent[0]["price"] < 100.0                # sell crosses the bid
+    assert 99.0 < sent[0]["price"] <= 100.0        # but stays within the buffer
+    assert abs(sent[0]["price"] / 0.05 - round(sent[0]["price"] / 0.05)) < 1e-6
+
+    sent.clear()
+    eng.buy_to_close(right="CE", strike=25000, qty=65, ref_price=100.0,
+                     reason="SQUAREOFF", token="73927",
+                     symbol="NIFTY29SEP26C25000", exchange="NFO")
+    assert sent[0]["price_type"] == "LMT"
+    assert sent[0]["price"] > 100.0                # buy crosses the ask
+    assert 100.0 <= sent[0]["price"] < 101.0
+
+
+def test_limit_price_rounds_to_tick_without_crossing_the_reference():
+    from app.execution.engine import ExecutionEngine as E
+
+    eng = E(client=None, paper_mode=True)
+    for ref in (0.05, 1.0, 27.1, 100.0, 1234.55, 0.1):
+        sell = eng._limit_price("SELL", ref)
+        buy = eng._limit_price("BUY", ref)
+        assert sell <= ref, (sell, ref)
+        assert buy >= ref, (buy, ref)
+        for px in (sell, buy):
+            assert abs(px / 0.05 - round(px / 0.05)) < 1e-6, (px, ref)
+
+
 def test_live_sends_broker_product_and_segment():
     sent = {}
 
@@ -239,7 +284,7 @@ class FakeRisk:
 LOT = 65  # NIFTY option lot size returned by the live broker (ls field)
 
 
-def make_live(lots=1, lot_size=LOT):
+def make_live(lots=1, lot_size=LOT, risk=None):
     p = StraddleParams(entry_time=dt.time(9, 20), squareoff_time=dt.time(15, 15),
                        sl_pct=0.50)
     ce_leg = SoldLeg(right="CE", strike=25000, sl_pct=0.50)
@@ -251,10 +296,109 @@ def make_live(lots=1, lot_size=LOT):
                        strike=25000, right="PE", exchange="NFO",
                        lot_size=lot_size)
     eng = ExecutionEngine(client=None, paper_mode=True)
-    live = LiveStraddle(params=p, exec_engine=eng, risk=FakeRisk(), date=DAY,
-                        lots=lots)
+    live = LiveStraddle(params=p, exec_engine=eng, risk=risk or FakeRisk(),
+                        date=DAY, lots=lots)
     live.configure(spot_token="999", legs=[(ce_leg, ce), (pe_leg, pe)])
     return live, eng
+
+
+def _capped_risk(max_daily_loss_pts=50.0):
+    """Real RiskManager with a tight daily cap for testing the live feed."""
+    cfg = type("Cfg", (), {
+        "kill_switch": False, "max_daily_loss_pts": max_daily_loss_pts,
+        "max_lots": 2, "max_entries_per_day": 2,
+        "no_new_entry_after": dt.time(14, 45)})()
+    rm = RiskManager(cfg)
+    rm.on_new_day(DAY)
+    return rm
+
+
+def test_leg_close_now_feeds_the_daily_loss_gate():
+    """Regression: nothing used to call on_trade_close() outside of tests, so
+    daily_pnl_pts stayed 0.0 and no RISK_MAX_DAILY_LOSS_PTS could ever halt a
+    live day. A stopped-out leg must move the counter."""
+    rm = _capped_risk(50.0)
+    live, eng = make_live(risk=rm)
+    live.on_tick(ts(9, 20), "1001", 120.0)
+    live.on_tick(ts(9, 20), "1002", 130.0)
+    live.on_tick(ts(9, 20, 5), "999", 25010.0)
+    assert live.phase == "IN_POSITION" and rm.daily_pnl_pts == 0.0
+
+    # Drive CE through its stop (120*1.5=180): realized -60 pts of premium.
+    live.on_tick(ts(9, 21), "1001", 150.0)
+    live.on_tick(ts(9, 22), "1001", 170.0)
+    live.on_tick(ts(9, 22, 30), "1001", 185.0)
+    live.on_tick(ts(9, 23), "1001", 200.0)          # 9:22 bar completes -> SL
+    # CE's stop breaches the 50-pt cap, which triggers the immediate flatten of
+    # PE; both closed legs are booked.
+    ce_close = (120.0 - 180.0) - 1.0 - 20.0 / LOT     # -61.31, backtest formula
+    pe_close = (130.0 - 130.0) - 1.0 - 20.0 / LOT     # flattened at last price
+    assert rm.daily_pnl_pts == pytest.approx(ce_close + pe_close, abs=0.01)
+    assert rm.halted_reason
+
+
+def test_daily_loss_cap_flattens_the_other_leg_at_once():
+    """0DTE safeguard: on expiry day an un-hedged short leg has no bounded
+    loss, so hitting the cap must close the open leg now rather than wait for
+    the 15:15 square-off."""
+    rm = _capped_risk(50.0)
+    live, eng = make_live(risk=rm)
+    live.on_tick(ts(9, 20), "1001", 120.0)
+    live.on_tick(ts(9, 20), "1002", 130.0)
+    live.on_tick(ts(9, 20, 5), "999", 25010.0)
+    assert live.legs["PE"].is_open
+
+    for t, px in [(ts(9, 21), 150.0), (ts(9, 22), 170.0),
+                  (ts(9, 22, 30), 185.0), (ts(9, 23), 200.0)]:
+        live.on_tick(t, "1001", px)
+
+    assert rm.halted_reason
+    assert not live.legs["CE"].is_open
+    assert not live.legs["PE"].is_open          # the surviving leg was flattened
+    assert live.phase == "DONE"
+    pe_exit = [f for f in eng.fills
+               if f.action == "BUY" and f.right == "PE"]
+    assert len(pe_exit) == 1 and pe_exit[0].reason == "SQUAREOFF"
+
+
+def test_leg_close_is_booked_exactly_once_per_leg():
+    """A square-off sweep must not re-report a leg that already exited on stop,
+    or one bad leg would count double against the daily cap."""
+    rm = _capped_risk(500.0)
+    live, eng = make_live(risk=rm)
+    live.on_tick(ts(9, 20), "1001", 120.0)
+    live.on_tick(ts(9, 20), "1002", 130.0)
+    live.on_tick(ts(9, 20, 5), "999", 25010.0)
+
+    live._report_leg_close("CE", 180.0)
+    first = rm.daily_pnl_pts
+    live._report_leg_close("CE", 180.0)
+    live._report_leg_close("CE", 180.0)
+    assert rm.daily_pnl_pts == pytest.approx(first, abs=0.01)
+    live.square_off(ts(15, 15))
+    # Only PE's close is added on top of the single CE report.
+    assert rm.daily_pnl_pts == pytest.approx(
+        first + ((130.0 - 130.0) - 1.0 - 20.0 / LOT), abs=0.01)
+
+
+def test_unpriced_close_is_never_booked_as_a_profit():
+    """square_off falls back to 0.0 with no quote. Booking entry-0.0 would be a
+    large fake PROFIT that keeps a losing day trading."""
+    rm = _capped_risk(500.0)
+    live, eng = make_live(risk=rm)
+    live.on_tick(ts(9, 20), "1001", 120.0)
+    live.on_tick(ts(9, 20), "1002", 130.0)
+    live.on_tick(ts(9, 20, 5), "999", 25010.0)
+
+    live._report_leg_close("CE", 0.0)
+    live._report_leg_close("CE", None)
+    live._report_leg_close("PE", -5.0)
+    assert rm.daily_pnl_pts == 0.0
+    assert rm.halted_reason is None
+    # Still unbooked, so a later real price is accepted for that leg.
+    live._report_leg_close("CE", 180.0)
+    assert rm.daily_pnl_pts < 0.0
+
 
 
 def test_live_entry_and_stop_exit():
@@ -290,11 +434,316 @@ def test_live_entry_and_stop_exit():
     assert len(pe_exit) == 1 and pe_exit[0].reason == "SQUAREOFF"
 
 
-def test_live_aborts_when_no_premium_at_entry():
+# --- late start / late arming (the 09:20 tick-ordering bug) ----------------
+# A session started at/after entry_time used to die on its very first poll:
+# session.py fed the spot tick before the option ticks, _on_spot() ran the
+# entry gate immediately, and a missing premium was treated as fatal
+# ("no premium for CE; aborting entry" -> phase DONE) instead of "not quoted
+# yet". The failure even masqueraded as a market-data fault, and because a
+# normal day warms leg prices from 09:15 it only ever showed up on a late start.
+
+def test_late_start_defers_then_enters_when_premiums_arrive():
     live, eng = make_live()
-    live.on_tick(ts(9, 20, 5), "999", 25010.0)     # spot, but zero option prices
+    live.on_tick(ts(9, 22), "999", 25010.0)        # late start: spot only
+    assert live.phase == "WAIT_ENTRY"              # deferred, NOT DONE
+    assert live.entry_deferred and eng.fills == []
+    assert any("entry deferred" in e for e in live.errors)
+    live.on_tick(ts(9, 22, 5), "1001", 120.0)      # one leg is not enough
+    assert live.phase == "WAIT_ENTRY" and eng.fills == []
+    live.on_tick(ts(9, 22, 6), "1002", 130.0)      # both legs -> entry fires
+    assert live.phase == "IN_POSITION"
+    assert len(eng.fills) == 2 and {f.qty for f in eng.fills} == {LOT}
+    assert live.legs["CE"].entry == 120.0 and live.legs["PE"].entry == 130.0
+    assert live.spot_ref == 25010.0 and live.entry_deferred is False
+
+
+def test_first_poll_after_entry_time_enters_when_legs_come_before_spot():
+    """session.py prices the legs first and the index last (the ordering fix).
+    With that order the very first loop at/after entry_time completes the
+    entry, because both premiums are cached before _on_spot() runs the gate."""
+    live, eng = make_live()
+    live.on_tick(ts(9, 25), "1001", 120.0)         # legs first
+    live.on_tick(ts(9, 25), "1002", 130.0)
+    assert live.phase == "WAIT_ENTRY"              # no spot yet: no attempt
+    live.on_tick(ts(9, 25), "999", 25010.0)        # then the index
+    assert live.phase == "IN_POSITION" and len(eng.fills) == 2
+
+
+def test_late_start_hours_after_entry_time_still_trades_before_cutoff():
+    live, eng = make_live()
+    live.risk = _risk()                            # entry cutoff 14:45
+    live.on_tick(ts(11, 0), "1001", 120.0)
+    live.on_tick(ts(11, 0), "1002", 130.0)
+    live.on_tick(ts(11, 0, 1), "999", 25010.0)
+    assert live.phase == "IN_POSITION" and len(eng.fills) == 2
+
+
+def test_deferred_entry_closes_day_past_the_entry_cutoff():
+    """A deferral must not outlive the entry window: once the risk gate's
+    no_new_entry_after has passed there is no trade left to wait for."""
+    live, eng = make_live()
+    live.risk = _risk(no_new_entry_after=dt.time(9, 30))
+    live.on_tick(ts(9, 35), "999", 25010.0)        # past cutoff, no premiums
     assert live.phase == "DONE" and eng.fills == []
-    assert any("no premium" in e for e in live.errors)
+    assert live.entry_deferred is False
+
+
+def test_persistent_broker_rejection_abandons_the_entry_without_spamming():
+    """A broker that keeps rejecting must not be retried every poll forever."""
+    class AlwaysRejects(LateArmBroker):
+        def __init__(self):
+            super().__init__()
+            self.live_armed = True
+
+        def place_order(self, **kw):
+            self.sent.append(kw)
+            return {"stat": "Not_Ok", "emsg": "nope"}
+
+    broker = AlwaysRejects()
+    eng = ExecutionEngine(client=broker, paper_mode=False)
+    live = _late_start_straddle(eng, FakeRisk())
+    live.on_tick(ts(9, 20), "1001", 120.0)
+    live.on_tick(ts(9, 20), "1002", 130.0)
+    for i in range(10):                            # ten polls, bounded retries
+        live.on_tick(ts(9, 20, i + 1), "999", 25010.0)
+    assert live.phase == "DONE"
+    assert live.entry_deferred is False
+    limit = int(getattr(__import__("app.config", fromlist=["settings"]).settings,
+                        "max_broker_entry_retries", 5))
+    assert len(broker.sent) == limit               # not 10
+    assert any("abandoning entry" in e for e in live.errors)
+
+
+def test_unarmed_live_entry_defers_until_the_operator_arms():
+    """Arming after entry_time must still open the day: the first attempt is
+    refused pre-send by the engine (not armed), which parks the entry rather
+    than burning the session, and the retry goes through once armed."""
+    broker = LateArmBroker()
+    eng = ExecutionEngine(client=broker, paper_mode=False)
+    live = _late_start_straddle(eng, FakeRisk())
+    live.on_tick(ts(9, 30), "1001", 120.0)
+    live.on_tick(ts(9, 30), "1002", 130.0)
+    live.on_tick(ts(9, 30, 1), "999", 25010.0)     # attempt refused: not armed
+    assert live.phase == "WAIT_ENTRY" and eng.fills == []
+    assert eng.pending_count() == 0                # refusal leaves no marker
+    assert any("not sent" in e for e in live.errors)
+
+    broker.live_armed = True                       # operator presses ARM LIVE
+    live.on_tick(ts(9, 31), "999", 25010.0)        # next poll retries
+    assert live.phase == "IN_POSITION"
+    assert len(broker.sent) == 2 and len(eng.fills) == 2
+    assert {f.qty for f in eng.fills} == {LOT}
+
+
+def test_second_leg_failure_unwinds_the_first_instead_of_going_naked():
+    """Half a straddle is a directional position nobody approved."""
+    class SecondLegBoom(LateArmBroker):
+        def place_order(self, **kw):
+            if len(self.sent) == 1:                # the PE sell blows up
+                self.sent.append(kw)
+                raise TimeoutError("no response on the second leg")
+            return super().place_order(**kw)
+
+    broker = SecondLegBoom()
+    broker.live_armed = True
+    eng = ExecutionEngine(client=broker, paper_mode=False)
+    live = _late_start_straddle(eng, FakeRisk())
+    live.on_tick(ts(9, 20), "1001", 120.0)
+    live.on_tick(ts(9, 20), "1002", 130.0)
+    live.on_tick(ts(9, 20, 1), "999", 25010.0)
+
+    assert live.phase == "DONE"
+    unwind = [f for f in eng.fills if f.reason == "ENTRY_UNWIND"]
+    assert len(unwind) == 1 and unwind[0].right == "CE"
+    assert unwind[0].action == "BUY"
+    assert not live.legs["CE"].is_open
+
+# --- deferred-entry reason (the mislabelled dashboard) ----------------------
+# The dashboard rendered entry_deferred as "- waiting for premiums" no matter
+# WHY the entry was parked. A day whose real problem was a broker rejecting
+# every submit therefore displayed a market-data message for hours, sending the
+# operator to look at quotes instead of the order path.
+
+def test_missing_quote_defers_with_the_quote_reason():
+    live, eng = make_live()
+    live.on_tick(ts(9, 20), "999", 25010.0)        # spot only, no leg premiums
+    assert live.entry_deferred is True
+    assert live.entry_deferred_reason == "quote"
+    assert live.status()["entry_deferred_reason"] == "quote"
+
+
+def test_refused_submit_defers_with_the_submit_reason_not_quote():
+    """An unarmed (refused) submit must NOT report itself as a quote problem."""
+    broker = LateArmBroker()
+    eng = ExecutionEngine(client=broker, paper_mode=False)
+    live = _late_start_straddle(eng, FakeRisk())
+    live.on_tick(ts(9, 20), "1001", 120.0)
+    live.on_tick(ts(9, 20), "1002", 130.0)
+    live.on_tick(ts(9, 20, 1), "999", 25010.0)
+    assert live.phase == "WAIT_ENTRY" and live.entry_deferred is True
+    assert live.entry_deferred_reason == "submit"   # not "quote"
+    assert live.status()["entry_deferred_reason"] == "submit"
+
+
+def test_broker_rejection_defers_with_the_rejected_reason():
+    """The exact failure this cost hours on: a broker rejection must be
+    reported as a rejection, never as 'waiting for premiums'."""
+    class AlwaysRejects(LateArmBroker):
+        def __init__(self):
+            super().__init__()
+            self.live_armed = True
+
+        def place_order(self, **kw):
+            self.sent.append(kw)
+            return {"stat": "Not_Ok", "emsg": "CASH shortfall"}
+
+    eng = ExecutionEngine(client=AlwaysRejects(), paper_mode=False)
+    live = _late_start_straddle(eng, FakeRisk())
+    live.on_tick(ts(9, 20), "1001", 120.0)
+    live.on_tick(ts(9, 20), "1002", 130.0)
+    live.on_tick(ts(9, 20, 1), "999", 25010.0)
+    assert live.entry_deferred is True
+    assert live.entry_deferred_reason == "rejected"
+    assert any("rejected by broker" in e for e in live.errors)
+
+
+def test_deferred_reason_clears_once_the_entry_fills():
+    live, eng = make_live()
+    live.on_tick(ts(9, 20), "999", 25010.0)
+    assert live.entry_deferred_reason == "quote"
+    live.on_tick(ts(9, 20, 5), "1001", 120.0)
+    live.on_tick(ts(9, 20, 6), "1002", 130.0)
+    assert live.phase == "IN_POSITION"
+    assert live.entry_deferred is False
+    assert live.entry_deferred_reason is None
+
+
+def test_engine_refuses_to_send_a_broker_rejected_price_type():
+    """MKT is refused for API orders (ALGO_CHK), so it must never leave the
+    process: sending it is a guaranteed rejection that retries forever.
+
+    Guards against a regression to the pre-fix engine, which sent
+    price_type="MKT", price=0 and produced ~200 rejected submits while every
+    other health signal looked green.
+    """
+    from app.broker.noren_client import (ALLOWED_LIVE_PRICE_TYPE,
+                                         REJECTED_LIVE_PRICE_TYPES)
+    from app.execution import engine as engine_mod
+
+    assert "MKT" in REJECTED_LIVE_PRICE_TYPES
+    assert ALLOWED_LIVE_PRICE_TYPE == "LMT"
+
+    broker = LateArmBroker()
+    broker.live_armed = True
+    eng = ExecutionEngine(client=broker, paper_mode=False)
+    eng.sell_to_open(right="CE", strike=25000, qty=LOT, ref_price=120.0,
+                     token="1001", symbol="NIFTY29SEP26C25000",
+                     exchange="NFO", ts=ts(9, 20))
+    assert broker.sent[0]["price_type"] == "LMT"
+    assert broker.sent[0]["price"] > 0              # a real limit, not 0/MKT
+
+    # And the guard itself: forcing a rejected type must refuse BEFORE sending.
+    orig = engine_mod.ALLOWED_LIVE_PRICE_TYPE
+    try:
+        engine_mod.ALLOWED_LIVE_PRICE_TYPE = "MKT"
+        broker.sent.clear()
+        with pytest.raises(OrderNotSubmitted):
+            eng.sell_to_open(right="CE", strike=25000, qty=LOT, ref_price=120.0,
+                             token="1001", symbol="NIFTY29SEP26C25000",
+                             exchange="NFO", ts=ts(9, 20))
+        assert broker.sent == []                    # never reached the broker
+        assert eng.pending_count() == 0             # no reconcile marker either
+    finally:
+        engine_mod.ALLOWED_LIVE_PRICE_TYPE = orig
+
+class CountingRisk:
+    """FakeRisk plus the one counter an entry must only ever bump once."""
+
+    def __init__(self):
+        self.entries = 0
+
+    def allow_entry(self, *, lots, now):
+        class Ok:
+            def __bool__(self):
+                return True
+        return Ok()
+
+    def record_entry(self):
+        self.entries += 1
+
+
+def _risk(no_new_entry_after=dt.time(14, 45)):
+    """Real RiskManager with an injectable entry cutoff."""
+    cfg = type("Cfg", (), {
+        "kill_switch": False, "max_daily_loss_pts": 400.0, "max_lots": 2,
+        "max_entries_per_day": 2, "no_new_entry_after": no_new_entry_after})()
+    return RiskManager(cfg)
+
+
+class LateArmBroker:
+    """Live client an operator arms mid-session.
+
+    ``place_order`` asserts rather than sends while disarmed: the engine is
+    supposed to refuse the order itself, so reaching the broker here would be
+    a regression the test must not silently tolerate.
+    """
+
+    def __init__(self):
+        self.live_armed = False
+        self.sent = []
+
+    def place_order(self, **kw):
+        if not self.live_armed:
+            raise AssertionError("order reached the broker while disarmed")
+        self.sent.append(kw)
+        return {"stat": "Ok", "norenordno": f"9000{len(self.sent):02d}"}
+
+
+def _late_start_straddle(eng, risk):
+    """One-lot ATM straddle wired the way session.run_day() wires it."""
+    p = StraddleParams(entry_time=dt.time(9, 20), sl_pct=0.5)
+    pairs = []
+    for right, token in (("CE", "1001"), ("PE", "1002")):
+        pairs.append((
+            SoldLeg(right=right, strike=25000, sl_pct=0.5),
+            LegInstrument(token=token,
+                          tradingsymbol=f"NIFTY29SEP26{right}25000",
+                          strike=25000, right=right, exchange="NFO",
+                          lot_size=LOT)))
+    live = LiveStraddle(params=p, exec_engine=eng, risk=risk, date=DAY, lots=1)
+    live.configure(spot_token="999", legs=pairs)
+    return live
+
+
+def test_entry_pins_the_strike_of_the_first_post_entry_spot():
+    """The ATM comes from the first spot tick at/after entry_time and is then
+    pinned, so a retry prices exactly the strike the day resolved."""
+    live, eng = make_live()
+    live.on_tick(ts(9, 20, 5), "999", 25010.0)     # ATM 25000, no premiums yet
+    assert live.phase == "WAIT_ENTRY"
+    live.on_tick(ts(9, 21), "1001", 120.0)
+    live.on_tick(ts(9, 21), "1002", 130.0)
+    assert live.phase == "IN_POSITION"
+    assert live.spot_ref == 25010.0                # latest spot for the UI
+    assert live.status()["atm"] == 25000           # strike stays pinned
+    assert {f.strike for f in eng.fills} == {25000}
+
+
+def test_deferred_entry_does_not_spam_errors_or_duplicate_orders():
+    live, eng = make_live()
+    live.risk = CountingRisk()
+    for i in range(5):                             # five empty polls in a row
+        live.on_tick(ts(9, 21, i), "999", 25010.0)
+    assert live.phase == "WAIT_ENTRY"              # deferred, NOT DONE
+    assert len([e for e in live.errors if "no premium for CE" in e]) == 1
+    assert len([e for e in live.errors if "no premium for PE" in e]) == 1
+    live.on_tick(ts(9, 21, 20), "1001", 120.0)
+    live.on_tick(ts(9, 21, 30), "1002", 130.0)     # both legs -> entry fires
+    assert live.phase == "IN_POSITION"
+    assert live.risk.entries == 1                  # booked exactly once
+    assert len(eng.fills) == 2 and {f.qty for f in eng.fills} == {LOT}
+    live.on_tick(ts(9, 22), "999", 25010.0)        # never a second straddle
+    assert len(eng.fills) == 2 and live.phase == "IN_POSITION"
 
 
 def test_live_refuses_entry_when_strike_mismatch():

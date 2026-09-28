@@ -136,9 +136,48 @@ class Settings:
     no_new_entry_after: dt.time = field(
         default_factory=lambda: _hhmm("RISK_NO_NEW_ENTRY_AFTER", "14:45")
     )
+    # A broker rejection that is not a policy refusal must not be retried
+    # forever: after this many the strategy abandons the entry and closes the
+    # day, instead of hammering the broker every poll.
+    max_broker_entry_retries: int = field(
+        default_factory=lambda: _int("RISK_MAX_ENTRY_RETRIES", 5)
+    )
+
+    # --- order pricing ---------------------------------------------------------
+    # Shoonya refuses MKT for API orders: "Rejected : ALGO_CHK: MKT Order type
+    # not allowed for API order" (verified live on 2026-09-28). Phone-app
+    # orders are exempt, so this only ever shows up on orders the bot sends.
+    # Every API order therefore goes out as a LIMIT priced this far through the
+    # spread, which fills promptly while the limit still caps the worst price.
+    order_limit_buffer_pct: float = field(
+        default_factory=lambda: _float("ORDER_LIMIT_BUFFER_PCT", 0.5)
+    )
+    order_tick_size: float = field(
+        default_factory=lambda: _float("ORDER_TICK_SIZE", 0.05)
+    )
 
     api_host: str = field(default_factory=lambda: os.getenv("API_HOST", "127.0.0.1"))
     api_port: int = field(default_factory=lambda: _int("API_PORT", 8000))
+
+    # --- trade journal (Excel) ------------------------------------------------
+    # One workbook per trading day plus a running master, so day trades are
+    # reportable without scraping logs. Lives under runtime/ (gitignored);
+    # override with JOURNAL_DIR for a folder that syncs to backup/drive.
+    journal_dir: Path = field(
+        default_factory=lambda: Path(
+            os.getenv("JOURNAL_DIR", str(BACKEND_DIR / "runtime" / "journal"))
+        )
+    )
+    journal_enabled: bool = field(
+        default_factory=lambda: _bool("JOURNAL_ENABLED", True)
+    )
+    # Brokerage charged per order, used for the journal's net P&L. Kept separate
+    # from StraddleParams.brokerage (a backtest model input) because the live
+    # number is whatever the broker actually bills - and paper-mode P&L should
+    # be reported against the real cost.
+    journal_brokerage_per_order: float = field(
+        default_factory=lambda: _float("JOURNAL_BROKERAGE_PER_ORDER", 20.0)
+    )
 
     @property
     def has_credentials(self) -> bool:
@@ -152,5 +191,14 @@ class Settings:
     def options_dir(self) -> Path:
         return self.data_dir / "nifty_options_1min"
 
+
+
+def update_access_token(token: str, uid: str = "", account_id: str = "") -> None:
+    """Dynamically update credentials on the singleton settings without restarting."""
+    object.__setattr__(settings, "access_token", token)
+    if uid:
+        object.__setattr__(settings, "uid", uid)
+    if account_id:
+        object.__setattr__(settings, "account_id", account_id)
 
 settings = Settings()

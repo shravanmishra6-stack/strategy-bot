@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Strategy Bot — NIFTY Short Straddle</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --line:#21262d; --fg:#e6edf3;
+    --dim:#8b949e; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --acc:#58a6ff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  header{display:flex;align-items:center;gap:16px;flex-wrap:wrap;
+         padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel)}
+  h1{font-size:16px;margin:0;letter-spacing:.4px}
+  .pill{padding:3px 10px;border-radius:999px;font-size:12px;font-weight:700;
+        border:1px solid var(--line)}
+  .live{background:#3d1d1f;color:#ff7b72;border-color:#6e2b28}
+  .paper{background:#1f2d1d;color:#7ee787;border-color:#315031}
+  .grid{display:grid;gap:14px;padding:20px;
+        grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+        padding:14px 16px}
+  .card h2{font-size:12px;margin:0 0 10px;color:var(--dim);text-transform:uppercase;
+           letter-spacing:.8px}
+  .kv{display:flex;justify-content:space-between;padding:4px 0;
+      border-bottom:1px dashed var(--line)}
+  .kv:last-child{border-bottom:0}
+  .kv b{font-weight:600}
+  .dim{color:var(--dim)}
+  .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)}
+  .btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
+  button{font:inherit;padding:7px 14px;border-radius:6px;cursor:pointer;
+         border:1px solid var(--line);background:#21262d;color:var(--fg)}
+  button:hover:not(:disabled){border-color:var(--acc)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .primary{background:#1f6feb;border-color:#1f6feb}
+  .danger{background:#a1282a;border-color:#a1282a}
+  .success{background:#238636;border-color:#2ea043;color:#fff}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:left;color:var(--dim);font-weight:600;padding:5px 6px;
+     border-bottom:1px solid var(--line);font-size:11px;text-transform:uppercase}
+  td{padding:5px 6px;border-bottom:1px solid var(--line)}
+  .tag{font-size:11px;padding:1px 7px;border-radius:4px;background:#21262d}
+  #msg{padding:8px 20px;font-size:13px;color:var(--warn);min-height:20px}
+  footer{padding:10px 20px;color:var(--dim);font-size:12px;
+         border-top:1px solid var(--line)}
+
+  /* Modal */
+  .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.75);
+                 align-items:center;justify-content:center;z-index:99}
+  .modal{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+         padding:20px;width:90%;max-width:500px;box-shadow:0 8px 24px rgba(0,0,0,0.5)}
+  .modal h3{margin:0 0 12px;font-size:15px;color:var(--fg)}
+  .modal ol{padding-left:20px;margin:10px 0;color:var(--dim);font-size:13px}
+  .modal ol li{margin-bottom:6px}
+  .modal a{color:var(--acc);text-decoration:none;word-break:break-all}
+  .modal a:hover{text-decoration:underline}
+  .modal input{width:100%;font:inherit;background:#0d1117;border:1px solid var(--line);
+               color:var(--fg);padding:8px 10px;border-radius:6px;margin:8px 0 14px}
+  .modal input:focus{border-color:var(--acc);outline:none}
+</style>
+</head>
+<body>
+<header>
+  <h1>NIFTY Short Straddle</h1>
+  <span id="mode" class="pill paper">…</span>
+  <span id="armed" class="pill">…</span>
+  <span id="conn" class="pill">broker: …</span>
+  <button id="b-login" class="success" style="padding:4px 12px;font-size:12px">Login / Refresh Token</button>
+  <span id="clock" class="dim" style="margin-left:auto"></span>
+</header>
+<div id="msg"></div>
+
+<div class="grid">
+  <div class="card">
+    <h2>Session</h2>
+    <div class="kv"><span class="dim">Status</span><b id="s-status">—</b></div>
+    <div class="kv"><span class="dim">Trading day</span><b id="s-day">—</b></div>
+    <div class="kv"><span class="dim">Phase</span><b id="s-phase">—</b></div>
+    <div class="kv"><span class="dim">Lots</span><b id="s-lots">—</b></div>
+    <div class="kv"><span class="dim">Spot ref (ATM)</span><b id="s-spot">—</b></div>
+    <div class="kv"><span class="dim">Expiry</span><b id="s-expiry">—</b></div>
+    <div class="kv"><span class="dim">Lot size</span><b id="s-lotsize">—</b></div>
+    <div class="btns">
+      <button id="b-start" class="primary">Start session</button>
+      <button id="b-stop">Stop</button>
+      <button id="b-arm" class="danger">ARM LIVE</button>
+      <button id="b-disarm">Disarm</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Risk</h2>
+    <div class="kv"><span class="dim">Daily P&amp;L (pts)</span><b id="r-pnl">0</b></div>
+    <div class="kv"><span class="dim">Entries today</span><b id="r-entries">0</b></div>
+    <div class="kv"><span class="dim">Max daily loss</span><b id="r-maxloss">—</b></div>
+    <div class="kv"><span class="dim">Max entries/day</span><b id="r-maxent">—</b></div>
+    <div class="kv"><span class="dim">No entry after</span><b id="r-cut">—</b></div>
+    <div class="kv"><span class="dim">Halted</span><b id="r-halt">none</b></div>
+  </div>
+
+  <div class="card">
+    <h2>Open legs</h2>
+    <table><thead><tr><th>Right</th><th>Strike</th><th>Entry</th>
+      <th>Last</th><th>SL</th><th>State</th></tr></thead>
+      <tbody id="legs"><tr><td colspan="6" class="dim">no position</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Fills</h2>
+    <table><thead><tr><th>Time</th><th>Action</th><th>Qty</th>
+      <th>Price</th><th>Reason</th><th>Mode</th></tr></thead>
+      <tbody id="fills"><tr><td colspan="6" class="dim">none yet</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Trade journal (Excel)</h2>
+    <div class="kv"><span class="dim">Today's workbook</span><b id="j-file" class="dim">not yet written</b></div>
+    <div class="kv"><span class="dim">Days recorded</span><b id="j-days">—</b></div>
+    <div class="kv"><span class="dim">Writes / failures</span><b id="j-writes">—</b></div>
+    <div class="kv"><span class="dim">Location</span><b id="j-dir" class="dim" style="max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title=""></b></div>
+    <div class="btns">
+      <button id="b-journal" class="primary">Download day</button>
+      <button id="b-journal-master">Master sheet</button>
+      <button id="b-journal-rebuild">Rebuild master</button>
+    </div>
+  </div>
+</div>
+
+
+<!-- Modal Dialog for Login / Token Refresh -->
+<div id="login-modal" class="modal-overlay">
+  <div class="modal">
+    <h3>Refresh Shoonya Session Token</h3>
+    <ol>
+      <li>Log in to <a href="https://trade.shoonya.com" target="_blank">trade.shoonya.com</a> in your browser.</li>
+      <li>Click <a id="oauth-link" href="#" target="_blank"><b>Open Shoonya Authorize Page &rarr;</b></a> to approve.</li>
+      <li>Copy the code from the redirect URL (e.g. <code>code=xxxx</code>).</li>
+    </ol>
+    <label class="dim" for="auth-input">Auth Code or Redirect URL:</label>
+    <input type="text" id="auth-input" placeholder="Paste auth code or redirect URL here" autocomplete="off" />
+    <div class="btns" style="justify-content:flex-end">
+      <button id="b-modal-cancel">Cancel</button>
+      <button id="b-modal-submit" class="primary">Exchange &amp; Save</button>
+    </div>
+  </div>
+</div>
+
+<footer>polling every 2s</footer>
+<script src="/static/app.js"></script>
+</body>
+</html>
