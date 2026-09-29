@@ -48,6 +48,15 @@ def status() -> dict:
     snap["has_credentials"] = settings.has_credentials
     snap["session_ok"] = client.session_ok
     snap["session_running"] = bool(_thread and _thread.is_alive())
+    comb = snap.get("combined") or {}
+    comb_pct = comb.get("sl_pct") if comb.get("sl_pct") is not None else settings.strategy_combined_sl_pct
+    comb_ent = comb.get("entry")
+    if comb_pct is not None and comb_ent is not None:
+        target_sl = round(comb_ent * comb_pct, 2)
+        comb["sl_level"] = target_sl
+        for leg in (snap.get("legs") or {}).values():
+            if leg.get("sl_level") is None:
+                leg["sl_level"] = target_sl
     snap["config"] = {
         "max_daily_loss_pts": settings.max_daily_loss_pts,
         "max_lots": settings.max_lots,
@@ -56,6 +65,8 @@ def status() -> dict:
         "product_type": settings.product_type,
         "root_symbol": settings.root_symbol,
         "fno_exchange": settings.fno_exchange,
+        "sl_pct": settings.strategy_sl_pct,
+        "combined_sl_pct": settings.strategy_combined_sl_pct,
     }
     return snap
 
@@ -247,11 +258,13 @@ def login_with_code(req: LoginCodeReq) -> JSONResponse:
 
 @app.get("/")
 def index() -> FileResponse:
-    return FileResponse(FRONTEND_DIR / "index.html")
+    return FileResponse(FRONTEND_DIR / "index.html",
+                        headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
 
 @app.get("/static/app.js")
 def app_js() -> FileResponse:
     return FileResponse(FRONTEND_DIR / "static" / "app.js",
-                        media_type="application/javascript")
+                        media_type="application/javascript",
+                        headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 

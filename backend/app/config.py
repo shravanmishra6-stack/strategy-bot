@@ -143,6 +143,34 @@ class Settings:
         default_factory=lambda: _int("RISK_MAX_ENTRY_RETRIES", 5)
     )
 
+    # Strategy settings
+    strategy_sl_pct: float | None = field(
+        default_factory=lambda: (
+            None if os.getenv("STRATEGY_SL_PCT", "").strip().lower() in ("none", "null", "false", "0")
+            else (
+                _float("STRATEGY_SL_PCT", 0.30)
+                if os.getenv("STRATEGY_SL_PCT") is not None
+                else (None if os.getenv("STRATEGY_COMBINED_SL_PCT") else 0.30)
+            )
+        )
+    )
+    strategy_combined_sl_pct: float | None = field(
+        default_factory=lambda: (
+            None if os.getenv("STRATEGY_COMBINED_SL_PCT", "").strip().lower() in ("none", "null", "false", "0", "")
+            else _float("STRATEGY_COMBINED_SL_PCT", 0.80)
+        )
+    )
+    strategy_sl_to_cost: bool = field(
+        default_factory=lambda: _bool("STRATEGY_SL_TO_COST", True)
+    )
+    strategy_target_pct: float | None = field(
+        default_factory=lambda: (
+            _float("STRATEGY_TARGET_PCT", 0.0)
+            if os.getenv("STRATEGY_TARGET_PCT") not in (None, "", "none", "null")
+            else None
+        )
+    )
+
     # --- order pricing ---------------------------------------------------------
     # Shoonya refuses MKT for API orders: "Rejected : ALGO_CHK: MKT Order type
     # not allowed for API order" (verified live on 2026-09-28). Phone-app

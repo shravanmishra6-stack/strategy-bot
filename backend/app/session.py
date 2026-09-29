@@ -77,6 +77,7 @@ class SessionState:
             "broker_rejections": 0,
             "phase": None,
             "legs": {},
+            "combined": {},
             "fills": [],
             "risk": {},
             "journal_path": None,
@@ -101,11 +102,38 @@ def _quote_price(res: InstrumentResolver, exchange: str, token: str):
     q = res.client.get_quotes(exchange, token) or {}
     if not isinstance(q, dict):
         return None
+    # Crucial safety check: ensure the response matches the requested token and exchange.
+    # A TCP/HTTP pipelining glitch must never accept an index spot quote for an option!
+    resp_token = str(q.get("token", "")).strip()
+    if resp_token and resp_token != str(token).strip():
+        log.warning("get_quotes token mismatch: requested %s, got %s - ignoring", token, resp_token)
+        return None
+    resp_exch = str(q.get("exch", "")).strip().upper()
+    if exchange and resp_exch and resp_exch != str(exchange).strip().upper():
+        log.warning("get_quotes exch mismatch: requested %s, got %s - ignoring", exchange, resp_exch)
+        return None
+
+    uc = None
+    try:
+        if q.get("uc"):
+            uc = float(q.get("uc"))
+    except (TypeError, ValueError):
+        pass
+
     for key in ("lp", "rt_price", "c"):
         try:
             val = q.get(key)
             if val is not None and float(val) > 0:
-                return float(val)
+                price = float(val)
+                # Option sanity check: F&O option premium cannot exceed its upper circuit or 2000 pts
+                if exchange == res.exchange:
+                    if uc is not None and price > uc:
+                        log.warning("Price %.2f exceeds upper circuit %.2f for %s - ignoring", price, uc, token)
+                        continue
+                    if price > 2000.0:
+                        log.warning("Absurd option price %.2f for %s - ignoring", price, token)
+                        continue
+                return price
         except (TypeError, ValueError):
             continue
     return None
@@ -142,7 +170,8 @@ def run_day(*, live: bool = False, poll_seconds: float = 5.0,
             state: SessionState | None = None,
             stop_event: threading.Event | None = None,
             journal: Journal | None = None,
-            today: dt.date | None = None) -> dict:
+            today: dt.date | None = None,
+            params: StraddleParams | None = None) -> dict:
     """Run one weekday session to completion. Returns the final status dict.
 
     ``live`` requests arming; it is still refused unless ``PAPER_MODE`` is off
@@ -171,7 +200,7 @@ def run_day(*, live: bool = False, poll_seconds: float = 5.0,
     status = None
     try:
         status = _run_day(st=st, stop=stop, today=today, journal=jr,
-                          live=live, poll_seconds=poll_seconds)
+                          live=live, poll_seconds=poll_seconds, params=params)
         return status
     finally:
         snapshot = st.snapshot()
@@ -200,7 +229,8 @@ def run_day(*, live: bool = False, poll_seconds: float = 5.0,
 
 
 def _run_day(*, st: SessionState, stop: threading.Event, today: dt.date,
-             journal: Journal, live: bool, poll_seconds: float) -> dict:
+             journal: Journal, live: bool, poll_seconds: float,
+             params: StraddleParams | None = None) -> dict:
     """The session itself, once run_day has opened the journal."""
     # 1) weekend guard - kept here too so _run_day is safe on its own.
     if today.weekday() >= 5:
@@ -259,7 +289,14 @@ def _run_day(*, st: SessionState, stop: threading.Event, today: dt.date,
              [(l.tradingsymbol, l.token) for l in legs])
 
     # 4) assemble the strategy exactly as the backtest does. One lot.
-    params = StraddleParams(lots=1)
+    if params is None:
+        params = StraddleParams(
+            lots=1,
+            sl_pct=settings.strategy_sl_pct,
+            combined_sl_pct=settings.strategy_combined_sl_pct,
+            sl_to_cost=settings.strategy_sl_to_cost,
+            target_pct=settings.strategy_target_pct,
+        )
     risk = RiskManager()
     # Register the trading day so daily_pnl_pts/entries_today/halted_reason are
     # anchored to it. Without this call the gate kept whatever it had picked up
@@ -273,7 +310,8 @@ def _run_day(*, st: SessionState, stop: threading.Event, today: dt.date,
                       sl_pct=params.sl_pct, target_pct=params.target_pct,
                       trail_pct=params.trail_pct), inst) for inst in legs]
     strat.configure(spot_token=res.index_token, legs=pairs)
-    st.update(phase=strat.phase, risk=risk.status())
+    st.update(phase=strat.phase, risk=risk.status(),
+              combined=strat.status().get("combined", {}))
 
     # The journal now knows everything needed to price a round trip: the live
     # fill list (read straight off the engine, so a fill can never be missed)
@@ -324,6 +362,15 @@ def _run_day(*, st: SessionState, stop: threading.Event, today: dt.date,
             st.update(error=str(e))
             log.warning("quote poll failed: %s", e)
 
+        if strat.params.combined_sl_pct is not None and getattr(strat, "combined_entry", None):
+            comb_sl = round(strat.combined_entry * float(strat.params.combined_sl_pct), 2)
+            strat.combined_sl_level = comb_sl
+            for l in strat.legs.values():
+                if getattr(strat, "_sl_to_cost_active", False):
+                    continue
+                if l.sl_level is None or l.sl_level != comb_sl:
+                    l.sl_level = comb_sl
+
         st.update(phase=strat.phase,
                   spot=strat.spot_ref or day["spot"],
                   atm=strat.status()["atm"],
@@ -331,6 +378,7 @@ def _run_day(*, st: SessionState, stop: threading.Event, today: dt.date,
                   entry_deferred_reason=strat.entry_deferred_reason,
                   broker_rejections=strat.broker_rejections,
                   legs={r: l.to_dict() for r, l in strat.legs.items()},
+                  combined=strat.status().get("combined", {}),
                   fills=[f.to_dict() for f in engine.fills],
                   risk=risk.status(), errors=list(strat.errors))
         # Journal every poll. record() only touches the disk when the fill
@@ -354,6 +402,7 @@ def _run_day(*, st: SessionState, stop: threading.Event, today: dt.date,
 
     st.update(status="done", phase=strat.phase,
               legs={r: l.to_dict() for r, l in strat.legs.items()},
+              combined=strat.status().get("combined", {}),
               fills=[f.to_dict() for f in engine.fills],
               risk=risk.status())
     log.info("session finished: phase=%s fills=%d", strat.phase,

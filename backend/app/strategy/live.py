@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from app.data.bars import MinuteBarBuilder
 from app.config import settings
 from app.execution.engine import OrderNotSubmitted, PermanentOrderRefusal
-from app.strategy.legs import Bar, SoldLeg
+from app.strategy.legs import Bar, COMBINED_SL, SL, SoldLeg
 from app.strategy.params import StraddleParams
 
 log = logging.getLogger("strategy.live")
@@ -62,6 +62,8 @@ class LiveStraddle:
     last_price: dict = field(default_factory=dict)   # token -> float
     lots: int = 1                         # contracts in LOTS (risk-gated)
     errors: list = field(default_factory=list)
+    combined_entry: float | None = None
+    combined_sl_level: float | None = None
     _spot_token: str | None = None
     _order_qty: dict = field(default_factory=dict)   # right -> validated qty
     # Set when entry was attempted while a leg premium had not been seen yet, or
@@ -115,6 +117,8 @@ class LiveStraddle:
         if token == self._spot_token:
             self._on_spot(ts, price)
         elif token in self.builders and self.phase == "IN_POSITION":
+            if self._check_combined_sl(ts):
+                return
             completed = self.builders[token].on_tick(ts, price)
             if completed:
                 self._on_leg_bar(token, completed)
@@ -278,8 +282,18 @@ class LiveStraddle:
         self.entry_deferred_reason = None
         self._waiting.clear()
         self.phase = "IN_POSITION"
-        log.info("ENTERED straddle CE%d/PE%d x%s @ %s", atm, want_pe,
-                 dict(self._order_qty), ts.strftime("%H:%M:%S"))
+        ce_leg, pe_leg = self.legs.get("CE"), self.legs.get("PE")
+        if ce_leg and pe_leg and ce_leg.entry is not None and pe_leg.entry is not None:
+            self.combined_entry = round(float(ce_leg.entry + pe_leg.entry), 4)
+            if self.params.combined_sl_pct is not None:
+                comb_sl = round(self.combined_entry * float(self.params.combined_sl_pct), 2)
+                self.combined_sl_level = comb_sl
+                ce_leg.sl_level = comb_sl
+                pe_leg.sl_level = comb_sl
+        log.info("ENTERED straddle CE%d/PE%d x%s @ %s (combined entry=%.2f, leg SL=%s)",
+                 atm, want_pe, dict(self._order_qty), ts.strftime("%H:%M:%S"),
+                 self.combined_entry or 0.0,
+                 f"{self.combined_sl_level:.2f}" if self.combined_sl_level else "none")
 
     def _send_leg(self, right: str, px: float, ts: dt.datetime) -> None:
         """Submit one leg's opening sell and arm its exit rules."""
@@ -367,6 +381,8 @@ class LiveStraddle:
                 symbol=inst.tradingsymbol, exchange=inst.exchange, ts=self.now,
             )
             self._report_leg_close(right, fill)
+            if reason in (SL, COMBINED_SL) and self.params.sl_to_cost:
+                self._move_surviving_legs_to_cost()
             # 0DTE safeguard: if the leg that just closed pushed the day past
             # the daily loss cap, the *other* leg must not be allowed to run on
             # until square-off time. On expiry day a short premium can grow
@@ -378,6 +394,61 @@ class LiveStraddle:
                 self.square_off(self.now or dt.datetime.now())
                 return
             self._check_day_closed()
+
+    def _move_surviving_legs_to_cost(self) -> None:
+        """When one leg hits SL, move remaining open leg(s) SL to their entry price (cost)."""
+        self._sl_to_cost_active = True
+        for r, l in self.legs.items():
+            if l.is_open and l.entry is not None:
+                l.sl_level = round(float(l.entry), 2)
+                l.trail_sl = None
+                log.info("One leg hit SL -> Moved surviving %s SL to cost (entry price): %.2f", r, l.sl_level)
+
+    def _check_combined_sl(self, ts: dt.datetime) -> bool:
+        if self.phase != "IN_POSITION" or self.params.combined_sl_pct is None:
+            return False
+        comb_entry = getattr(self, "combined_entry", None)
+        if comb_entry is None:
+            return False
+        comb_sl = round(comb_entry * float(self.params.combined_sl_pct), 2)
+        self.combined_sl_level = comb_sl
+
+        hit = False
+        for right, leg in self.legs.items():
+            if not leg.is_open:
+                continue
+            if getattr(self, "_sl_to_cost_active", False):
+                stop = leg.sl_level or leg.entry
+            else:
+                if leg.sl_level is None or leg.sl_level != comb_sl:
+                    leg.sl_level = comb_sl
+                stop = leg.active_stop or comb_sl
+            inst = self.instruments.get(right)
+            px = (self.last_price.get(inst.token) if inst else None) or leg.last_close or leg.entry
+            if px is None or px <= 0:
+                continue
+            # Sanity guard: an option premium cannot be an index spot quote (> 2000 pts or > 10x entry)
+            if px > 2000.0 or (leg.entry and px > leg.entry * 10):
+                log.error("Rejecting corrupt %s price %.2f (entry %.2f) in SL check", right, px, leg.entry or 0)
+                continue
+            if stop is not None and px >= stop:
+                log.warning(
+                    "LEG SL HIT: %s price %.2f >= SL %.2f (rule SL: %.2f)",
+                    right, px, stop, comb_sl
+                )
+                self.exec_engine.buy_to_close(
+                    right=right, strike=inst.strike,
+                    qty=self._order_qty.get(right) or self._qty_for(inst),
+                    ref_price=px, reason=SL, token=inst.token,
+                    symbol=inst.tradingsymbol, exchange=inst.exchange, ts=ts,
+                )
+                leg.is_open = False
+                self._report_leg_close(right, px)
+                if self.params.sl_to_cost:
+                    self._move_surviving_legs_to_cost()
+                self._check_day_closed()
+                hit = True
+        return hit
 
     def square_off(self, ts: dt.datetime) -> None:
         for right, leg in self.legs.items():
@@ -403,6 +474,22 @@ class LiveStraddle:
 
     # --- status -----------------------------------------------------------------
     def status(self) -> dict:
+        comb_entry = getattr(self, "combined_entry", None)
+        comb_sl = getattr(self, "combined_sl_level", None)
+        comb_sl_pts = (
+            round(comb_entry * self.params.combined_sl_pct, 2)
+            if comb_entry is not None and self.params.combined_sl_pct is not None
+            else None
+        )
+        comb_curr = None
+        if self.phase == "IN_POSITION":
+            open_legs = [l for l in self.legs.values() if l.is_open]
+            if open_legs:
+                comb_curr = sum(
+                    (self.last_price.get(self.instruments[r].token) if r in self.instruments else None)
+                    or l.last_close or l.entry or 0.0
+                    for r, l in self.legs.items() if l.is_open
+                )
         return {
             "phase": self.phase,
             "date": str(self.date),
@@ -413,6 +500,13 @@ class LiveStraddle:
             "entry_deferred_reason": self.entry_deferred_reason,
             "order_qty": dict(self._order_qty),
             "legs": {r: l.to_dict() for r, l in self.legs.items()},
+            "combined": {
+                "sl_pct": self.params.combined_sl_pct,
+                "entry": comb_entry,
+                "sl_pts": comb_sl_pts,
+                "sl_level": comb_sl,
+                "current": round(comb_curr, 2) if comb_curr is not None else None,
+            },
             "instruments": {
                 r: {"symbol": i.tradingsymbol, "token": i.token,
                     "exchange": i.exchange, "lot_size": i.lot_size}

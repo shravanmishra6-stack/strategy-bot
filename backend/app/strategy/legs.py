@@ -31,6 +31,7 @@ class Bar:
 
 # Exit reasons, shared with the backtest trade log and the dashboard UI.
 SL = "SL"
+COMBINED_SL = "COMBINED_SL"
 TRAIL_SL = "TRAIL_SL"
 TARGET = "TARGET"
 SQUAREOFF = "SQUAREOFF"

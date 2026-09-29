@@ -16,6 +16,7 @@ import pandas as pd
 
 from app.backtest.metrics import summarize
 from app.strategy.legs import (
+    COMBINED_SL,
     EOD_FINAL,
     HOLD_TO_EXPIRY,
     SL,
@@ -26,7 +27,7 @@ from app.strategy.legs import (
 )
 from app.strategy.params import StraddleParams
 
-STOP_REASONS = (SL, TRAIL_SL)
+STOP_REASONS = (SL, COMBINED_SL, TRAIL_SL)
 
 
 def _clean_price(val, fallback: float) -> float:
@@ -88,6 +89,14 @@ def backtest_one_day(
     else:
         so_dt = timeline.max() + pd.Timedelta(minutes=1)
 
+    comb_sl = None
+    if p.combined_sl_pct is not None:
+        entries = [box["leg"].entry for box in legs.values() if box["leg"].entry is not None]
+        if len(entries) == len(legs):
+            comb_sl = round(sum(entries) * p.combined_sl_pct, 2)
+            for box in legs.values():
+                box["leg"].sl_level = comb_sl
+
     exits = []
     for ts in timeline:
         if ts >= so_dt:
@@ -104,6 +113,7 @@ def backtest_one_day(
                     leg.is_open = False
             break
 
+
         for right, box in legs.items():
             leg, df = box["leg"], box["df"]
             if not leg.is_open or ts not in df.index:
@@ -111,6 +121,10 @@ def backtest_one_day(
             res = leg.on_bar(Bar.from_row(df.loc[ts]))
             if res:
                 exits.append((right, ts, res[1], res[0]))
+                if res[0] == SL and p.sl_to_cost:
+                    for other_right, other_box in legs.items():
+                        if other_box["leg"].is_open and other_box["leg"].entry is not None:
+                            other_box["leg"].sl_level = other_box["leg"].entry
 
     for right, box in legs.items():
         leg = box["leg"]

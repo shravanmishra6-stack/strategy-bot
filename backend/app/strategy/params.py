@@ -21,6 +21,8 @@ class StraddleParams:
     expiry_mode: str = "EOD"  # "EOD" (square off) | "EXPIRY" (hold to last bar)
 
     sl_pct: float | None = 0.30       # stop when a leg's premium rises +30%
+    combined_sl_pct: float | None = None  # stop when total straddle premium rises +X% (e.g. 0.80)
+    sl_to_cost: bool = False          # if one leg hits SL, move other leg's SL to entry (cost)
     target_pct: float | None = None   # take profit when premium falls -X%
     trail_pct: float | None = None    # trail once leg moves X% of SL distance
     strike_offset: int = 0            # 0 = ATM straddle, >0 = strangle (PE further OTM)
@@ -52,6 +54,10 @@ class StraddleParams:
             bits.append(f"SQO {self.squareoff_time:%H:%M}")
         if self.sl_pct:
             bits.append(f"SL {self.sl_pct:.0%}")
+        if self.combined_sl_pct:
+            bits.append(f"CombSL {self.combined_sl_pct:.0%}")
+        if self.sl_to_cost:
+            bits.append("SL->Cost")
         if self.target_pct:
             bits.append(f"TGT {self.target_pct:.0%}")
         if self.trail_pct:
@@ -67,6 +73,8 @@ class StraddleParams:
             "squareoff_time": f"{self.squareoff_time:%H:%M}",
             "expiry_mode": self.expiry_mode,
             "sl_pct": self.sl_pct,
+            "combined_sl_pct": self.combined_sl_pct,
+            "sl_to_cost": self.sl_to_cost,
             "target_pct": self.target_pct,
             "trail_pct": self.trail_pct,
             "strike_offset": self.strike_offset,
@@ -91,6 +99,8 @@ class StraddleParams:
             squareoff_time=_t("squareoff_time", cls.squareoff_time),
             expiry_mode=d.get("expiry_mode", cls.expiry_mode),
             sl_pct=d.get("sl_pct", cls.sl_pct),
+            combined_sl_pct=d.get("combined_sl_pct", cls.combined_sl_pct),
+            sl_to_cost=bool(d.get("sl_to_cost", cls.sl_to_cost)),
             target_pct=d.get("target_pct", cls.target_pct),
             trail_pct=d.get("trail_pct", cls.trail_pct),
             strike_offset=int(d.get("strike_offset", cls.strike_offset)),

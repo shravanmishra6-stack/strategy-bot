@@ -69,6 +69,7 @@
   <span id="mode" class="pill paper">…</span>
   <span id="armed" class="pill">…</span>
   <span id="conn" class="pill">broker: …</span>
+  <span id="header-pnl" class="pill" style="font-size:13px;padding:3px 12px;font-weight:700">P&amp;L: ₹0.00</span>
   <button id="b-login" class="success" style="padding:4px 12px;font-size:12px">Login / Refresh Token</button>
   <span id="clock" class="dim" style="margin-left:auto"></span>
 </header>
@@ -93,8 +94,9 @@
   </div>
 
   <div class="card">
-    <h2>Risk</h2>
-    <div class="kv"><span class="dim">Daily P&amp;L (pts)</span><b id="r-pnl">0</b></div>
+    <h2>Risk &amp; P&amp;L</h2>
+    <div class="kv"><span class="dim">Live MTM P&amp;L</span><b id="r-live-pnl" style="font-size:15px;font-weight:700">₹0.00</b></div>
+    <div class="kv"><span class="dim">Realized P&amp;L (pts)</span><b id="r-pnl">0</b></div>
     <div class="kv"><span class="dim">Entries today</span><b id="r-entries">0</b></div>
     <div class="kv"><span class="dim">Max daily loss</span><b id="r-maxloss">—</b></div>
     <div class="kv"><span class="dim">Max entries/day</span><b id="r-maxent">—</b></div>
@@ -105,9 +107,21 @@
   <div class="card">
     <h2>Open legs</h2>
     <table><thead><tr><th>Right</th><th>Strike</th><th>Entry</th>
-      <th>Last</th><th>SL</th><th>State</th></tr></thead>
-      <tbody id="legs"><tr><td colspan="6" class="dim">no position</td></tr></tbody>
+      <th>Last</th><th>P&amp;L</th><th>SL</th><th>State</th></tr></thead>
+      <tbody id="legs"><tr><td colspan="7" class="dim">no position</td></tr></tbody>
     </table>
+    <div class="kv" style="margin-top:8px;padding-top:6px;border-top:1px dashed var(--line);">
+      <span class="dim">Live Position P&amp;L</span><b id="comb-pnl-val" style="font-size:14px;font-weight:700">—</b>
+    </div>
+    <div class="kv">
+      <span class="dim">Combined Premium</span><b id="comb-curr-val">—</b>
+    </div>
+    <div class="kv">
+      <span class="dim">Combined SL (80%)</span><b id="comb-sl-val">—</b>
+    </div>
+    <div class="kv">
+      <span class="dim">Leg SL Rule</span><b id="comb-exit-val">—</b>
+    </div>
   </div>
 
   <div class="card">
@@ -152,6 +166,6 @@
 </div>
 
 <footer>polling every 2s</footer>
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=6"></script>
 </body>
 </html>
