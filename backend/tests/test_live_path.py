@@ -211,8 +211,7 @@ def test_api_orders_use_a_marketable_limit_never_mkt():
                      reason="SQUAREOFF", token="73927",
                      symbol="NIFTY29SEP26C25000", exchange="NFO")
     assert sent[0]["price_type"] == "LMT"
-    assert sent[0]["price"] > 100.0                # buy crosses the ask
-    assert 100.0 <= sent[0]["price"] < 101.0
+    assert 100.0 < sent[0]["price"] <= 115.0      # aggressive market exit buffer to guarantee fill
 
 
 def test_limit_price_rounds_to_tick_without_crossing_the_reference():

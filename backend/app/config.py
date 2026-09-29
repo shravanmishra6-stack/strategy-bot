@@ -180,6 +180,16 @@ class Settings:
     order_limit_buffer_pct: float = field(
         default_factory=lambda: _float("ORDER_LIMIT_BUFFER_PCT", 0.5)
     )
+    # Aggressive buffer specifically for EXITS (SL / Square-off / Stop).
+    # Since API rejects MKT orders ("ALGO_CHK"), exit orders are sent as
+    # marketable LIMIT orders priced aggressively above the Ask (for BUY)
+    # so the exchange matching engine fills them instantly at the best market price.
+    order_exit_buffer_pct: float = field(
+        default_factory=lambda: _float("ORDER_EXIT_BUFFER_PCT", 10.0)
+    )
+    order_exit_min_buffer_pts: float = field(
+        default_factory=lambda: _float("ORDER_EXIT_MIN_BUFFER_PTS", 3.0)
+    )
     order_tick_size: float = field(
         default_factory=lambda: _float("ORDER_TICK_SIZE", 0.05)
     )
