@@ -84,6 +84,7 @@ class SessionState:
             "journal_writes": 0,
             "journal_failures": 0,
             "updated_at": None,
+            "pnl_history": [],
         }
 
     def update(self, **kw) -> None:
@@ -281,22 +282,46 @@ def _run_day(*, st: SessionState, stop: threading.Event, today: dt.date,
         "legs": [{"right": l.right, "symbol": l.tradingsymbol,
                   "token": l.token, "strike": l.strike,
                   "exchange": l.exchange, "lot_size": l.lot_size,
-                  "order_qty": 1 * (l.lot_size or 0)} for l in legs],
+                  "order_qty": None} for l in legs],  # set after params
     }
     st.update(resolved=resolved, spot=day["spot"], status="resolved",
               live_armed=client.live_armed)
     log.info("resolved %s ATM %s: %s", day["expiry"], day["atm"],
              [(l.tradingsymbol, l.token) for l in legs])
 
-    # 4) assemble the strategy exactly as the backtest does. One lot.
+    # 4) assemble the strategy exactly as the backtest does.
+    # Dashboard runtime overrides (lots, SL%, straddle/strangle) win over .env.
     if params is None:
+        try:
+            from app.api import runtime_overrides
+        except ImportError:
+            runtime_overrides = {}
+        _lots = runtime_overrides.get("lots", 1)
+        # Parse optional HH:MM time overrides
+        def _parse_time(key, default):
+            raw = runtime_overrides.get(key)
+            if raw:
+                try:
+                    hh, mm = raw.strip().split(":")
+                    return dt.time(int(hh), int(mm))
+                except (ValueError, AttributeError):
+                    pass
+            return default
         params = StraddleParams(
-            lots=1,
-            sl_pct=settings.strategy_sl_pct,
-            combined_sl_pct=settings.strategy_combined_sl_pct,
-            sl_to_cost=settings.strategy_sl_to_cost,
-            target_pct=settings.strategy_target_pct,
+            lots=_lots,
+            sl_pct=runtime_overrides.get("sl_pct", settings.strategy_sl_pct),
+            combined_sl_pct=runtime_overrides.get(
+                "combined_sl_pct", settings.strategy_combined_sl_pct),
+            sl_to_cost=runtime_overrides.get(
+                "sl_to_cost", settings.strategy_sl_to_cost),
+            target_pct=runtime_overrides.get(
+                "target_pct", settings.strategy_target_pct),
+            strike_offset=runtime_overrides.get("strike_offset", 0),
+            entry_time=_parse_time("entry_time", dt.time(9, 20)),
+            squareoff_time=_parse_time("squareoff_time", dt.time(15, 15)),
         )
+    else:
+        _lots = params.lots
     risk = RiskManager()
     # Register the trading day so daily_pnl_pts/entries_today/halted_reason are
     # anchored to it. Without this call the gate kept whatever it had picked up
@@ -305,18 +330,22 @@ def _run_day(*, st: SessionState, stop: threading.Event, today: dt.date,
     risk.on_new_day(today)
     engine = ExecutionEngine(client, paper_mode=settings.paper_mode)
     strat = LiveStraddle(params=params, exec_engine=engine, risk=risk,
-                         date=today, lots=1)
+                         date=today, lots=_lots)
     pairs = [(SoldLeg(right=inst.right, strike=inst.strike, token=inst.token,
                       sl_pct=params.sl_pct, target_pct=params.target_pct,
                       trail_pct=params.trail_pct), inst) for inst in legs]
     strat.configure(spot_token=res.index_token, legs=pairs)
+    # Backfill resolved order_qty now that lots is known
+    for rleg in resolved["legs"]:
+        rleg["order_qty"] = _lots * (rleg.get("lot_size") or 0)
     st.update(phase=strat.phase, risk=risk.status(),
-              combined=strat.status().get("combined", {}))
+              combined=strat.status().get("combined", {}),
+              lots=_lots, resolved=resolved)
 
     # The journal now knows everything needed to price a round trip: the live
     # fill list (read straight off the engine, so a fill can never be missed)
     # and the broker-confirmed lot size, which converts points to rupees.
-    journal.attach_day(engine=engine, lot_size=day["lot_size"], lots=1,
+    journal.attach_day(engine=engine, lot_size=day["lot_size"], lots=_lots,
                        params={**params.to_dict(),
                                "ce_symbol": next((l.tradingsymbol for l in legs
                                                   if l.right == "CE"), None),

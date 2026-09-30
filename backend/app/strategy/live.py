@@ -85,6 +85,12 @@ class LiveStraddle:
     # one once instead of flooding the dashboard every poll. Holds leg rights
     # ("CE"/"PE") and the pseudo-key "submit".
     _waiting: set = field(default_factory=set)
+    # Broker-side SL-LMT order IDs keyed by right ("CE"/"PE").
+    # Placed immediately after entry so the exchange enforces the stop;
+    # cancelled/modified as position state changes.
+    _broker_sl_orders: dict = field(default_factory=dict)
+    # Flag: broker SL orders have already been placed for this entry.
+    _broker_sl_placed: bool = False
 
     def configure(self, *, spot_token: str,
                   legs: list[tuple[SoldLeg, LegInstrument]]):
@@ -294,6 +300,9 @@ class LiveStraddle:
                  atm, want_pe, dict(self._order_qty), ts.strftime("%H:%M:%S"),
                  self.combined_entry or 0.0,
                  f"{self.combined_sl_level:.2f}" if self.combined_sl_level else "none")
+        # Place broker-side SL-LMT orders immediately after entry so the exchange
+        # enforces the stop without relying on our polling loop.
+        self._place_broker_sl_orders()
 
     def _send_leg(self, right: str, px: float, ts: dt.datetime) -> None:
         """Submit one leg's opening sell and arm its exit rules."""
@@ -304,6 +313,73 @@ class LiveStraddle:
             exchange=inst.exchange, ts=ts,
         )
         self.legs[right].arm(px)
+
+    def _place_broker_sl_orders(self) -> None:
+        """Place SL-LMT BUY orders at the broker for every open leg.
+
+        Called once after entry. The broker holds these orders and the exchange
+        triggers them automatically — no polling required. In-memory SL checks
+        remain as a backup in case the broker order lags or is rejected.
+        """
+        if self._broker_sl_placed:
+            return
+        sl_level = self.combined_sl_level
+        if sl_level is None:
+            log.info("No combined SL level set; skipping broker SL orders")
+            return
+        placed_any = False
+        for right, leg in self.legs.items():
+            if not leg.is_open or leg.entry is None:
+                continue
+            inst = self.instruments.get(right)
+            if inst is None:
+                continue
+            qty = self._order_qty.get(right) or self._qty_for(inst)
+            try:
+                orderno = self.exec_engine.place_broker_sl(
+                    right=right,
+                    strike=inst.strike,
+                    qty=qty,
+                    sl_trigger=sl_level,
+                    token=inst.token,
+                    symbol=inst.tradingsymbol,
+                    exchange=inst.exchange,
+                )
+                if orderno:
+                    self._broker_sl_orders[right] = orderno
+                    log.info("Broker SL order placed for %s: orderno=%s trigger=%.2f",
+                             right, orderno, sl_level)
+                placed_any = True
+            except Exception as e:
+                log.error("Failed to place broker SL for %s: %s", right, e)
+        if placed_any:
+            self._broker_sl_placed = True
+
+    def _cancel_broker_sl(self, right: str) -> None:
+        """Cancel broker SL order for one leg (called when leg exits by any path)."""
+        orderno = self._broker_sl_orders.pop(right, None)
+        if orderno:
+            inst = self.instruments.get(right)
+            self.exec_engine.cancel_broker_sl(
+                orderno, symbol=inst.tradingsymbol if inst else "")
+
+    def _modify_broker_sl_to_cost(self, right: str, cost: float) -> None:
+        """Modify surviving leg's broker SL order to cost price (SL-to-cost)."""
+        orderno = self._broker_sl_orders.get(right)
+        if not orderno:
+            return
+        inst = self.instruments.get(right)
+        qty = self._order_qty.get(right) or (self._qty_for(inst) if inst else 0)
+        self.exec_engine.modify_broker_sl(
+            orderno=orderno,
+            right=right,
+            qty=qty,
+            new_trigger=cost,
+            symbol=inst.tradingsymbol if inst else None,
+            exchange=inst.exchange if inst else None,
+        )
+        log.info("Broker SL for %s modified to cost %.2f (orderno=%s)",
+                 right, cost, orderno)
 
     def _report_leg_close(self, right: str, exit_px: float) -> None:
         """Feed one closed leg's realized points to the risk gate.
@@ -373,6 +449,7 @@ class LiveStraddle:
                              close=bar.close))
         if res:
             reason, fill = res
+            leg.last_close = fill   # stamp exact exit fill so PnL is correct
             inst = self.instruments[right]
             self.exec_engine.buy_to_close(
                 right=right, strike=inst.strike,
@@ -380,6 +457,8 @@ class LiveStraddle:
                 ref_price=fill, reason=reason, token=inst.token,
                 symbol=inst.tradingsymbol, exchange=inst.exchange, ts=self.now,
             )
+            # Cancel the broker SL order — leg already exited via bar-SL
+            self._cancel_broker_sl(right)
             self._report_leg_close(right, fill)
             if reason in (SL, COMBINED_SL) and self.params.sl_to_cost:
                 self._move_surviving_legs_to_cost()
@@ -403,6 +482,8 @@ class LiveStraddle:
                 l.sl_level = round(float(l.entry), 2)
                 l.trail_sl = None
                 log.info("One leg hit SL -> Moved surviving %s SL to cost (entry price): %.2f", r, l.sl_level)
+                # Also modify the broker-side SL order to the new cost trigger
+                self._modify_broker_sl_to_cost(r, l.sl_level)
 
     def _check_combined_sl(self, ts: dt.datetime) -> bool:
         if self.phase != "IN_POSITION" or self.params.combined_sl_pct is None:
@@ -443,6 +524,9 @@ class LiveStraddle:
                     symbol=inst.tradingsymbol, exchange=inst.exchange, ts=ts,
                 )
                 leg.is_open = False
+                leg.last_close = px   # stamp exit fill so PnL is correct
+                # Cancel broker SL — leg already exited via in-memory SL check
+                self._cancel_broker_sl(right)
                 self._report_leg_close(right, px)
                 if self.params.sl_to_cost:
                     self._move_surviving_legs_to_cost()
@@ -465,6 +549,9 @@ class LiveStraddle:
                     symbol=inst.tradingsymbol, exchange=inst.exchange, ts=ts,
                 )
                 leg.is_open = False
+                leg.last_close = px   # stamp exit fill so PnL is correct
+                # Cancel broker SL — we are squaring off manually
+                self._cancel_broker_sl(right)
                 self._report_leg_close(right, px)
         self.phase = "DONE"
 
@@ -482,14 +569,25 @@ class LiveStraddle:
             else None
         )
         comb_curr = None
-        if self.phase == "IN_POSITION":
-            open_legs = [l for l in self.legs.values() if l.is_open]
-            if open_legs:
-                comb_curr = sum(
-                    (self.last_price.get(self.instruments[r].token) if r in self.instruments else None)
-                    or l.last_close or l.entry or 0.0
-                    for r, l in self.legs.items() if l.is_open
-                )
+        # Include ALL legs (open + closed) so PnL reflects realized losses too.
+        # For open legs: use latest live tick; for closed legs: last_close holds
+        # the stamped exit fill price set at closure time.
+        if self.legs:
+            any_priced = any(
+                l.entry is not None for l in self.legs.values()
+            )
+            if any_priced:
+                total = 0.0
+                for r, l in self.legs.items():
+                    inst = self.instruments.get(r)
+                    if l.is_open:
+                        px = (self.last_price.get(inst.token) if inst else None) \
+                             or l.last_close or l.entry or 0.0
+                    else:
+                        # Closed leg: last_close was stamped to exit fill at closure
+                        px = l.last_close or l.entry or 0.0
+                    total += px
+                comb_curr = round(total, 2)
         return {
             "phase": self.phase,
             "date": str(self.date),
@@ -512,6 +610,7 @@ class LiveStraddle:
                     "exchange": i.exchange, "lot_size": i.lot_size}
                 for r, i in self.instruments.items()
             },
+            "broker_sl_orders": dict(self._broker_sl_orders),
             "errors": self.errors[-5:],
         }
 

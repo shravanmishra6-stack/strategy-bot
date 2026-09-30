@@ -23,6 +23,7 @@ from app import journal as journal_mod
 from app.session import SessionState, run_day
 from scripts.oauth_login import exchange_and_save, _make_api
 from pydantic import BaseModel
+from typing import Optional
 
 log = logging.getLogger("api")
 
@@ -38,6 +39,37 @@ app = FastAPI(title="Strategy Bot", version="1.0")
 _state = SessionState()
 _stop = threading.Event()
 _thread: threading.Thread | None = None
+
+# --- Runtime strategy overrides (changed via dashboard, read by session.py) ---
+# These override .env / Settings defaults for the NEXT session start and, where
+# possible, patch the running strategy in-flight.
+# Persisted to disk so they survive server restarts.
+import json as _json
+
+_OVERRIDES_FILE = Path(__file__).resolve().parent.parent / "runtime" / "overrides.json"
+
+
+def _load_overrides() -> dict:
+    """Load runtime overrides from disk (if any)."""
+    try:
+        if _OVERRIDES_FILE.is_file():
+            return _json.loads(_OVERRIDES_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.warning("failed to load overrides.json: %s", e)
+    return {}
+
+
+def _save_overrides() -> None:
+    """Persist current runtime overrides to disk."""
+    try:
+        _OVERRIDES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _OVERRIDES_FILE.write_text(
+            _json.dumps(runtime_overrides, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.error("failed to save overrides.json: %s", e)
+
+
+runtime_overrides: dict = _load_overrides()
 
 
 @app.get("/api/status")
@@ -68,6 +100,28 @@ def status() -> dict:
         "sl_pct": settings.strategy_sl_pct,
         "combined_sl_pct": settings.strategy_combined_sl_pct,
     }
+    # Strategy rules: merge .env defaults with any runtime overrides
+    from app.strategy.params import StraddleParams
+    defaults = StraddleParams(
+        lots=runtime_overrides.get("lots", 1),
+        sl_pct=runtime_overrides.get("sl_pct", settings.strategy_sl_pct),
+        combined_sl_pct=runtime_overrides.get("combined_sl_pct", settings.strategy_combined_sl_pct),
+        sl_to_cost=runtime_overrides.get("sl_to_cost", settings.strategy_sl_to_cost),
+        target_pct=runtime_overrides.get("target_pct", settings.strategy_target_pct),
+        strike_offset=runtime_overrides.get("strike_offset", 0),
+    )
+    # Overlay entry/squareoff time from runtime overrides
+    import datetime as _dt
+    sp_dict = defaults.to_dict()
+    if "entry_time" in runtime_overrides:
+        sp_dict["entry_time"] = runtime_overrides["entry_time"]
+    if "squareoff_time" in runtime_overrides:
+        sp_dict["squareoff_time"] = runtime_overrides["squareoff_time"]
+    snap["strategy_params"] = {
+        **sp_dict,
+        "strategy_type": "strangle" if defaults.strike_offset > 0 else "straddle",
+    }
+    snap["runtime_overrides"] = dict(runtime_overrides)
     return snap
 
 
@@ -128,6 +182,95 @@ def stop() -> dict:
 class LoginCodeReq(BaseModel):
     auth_code: str
     uid: str = ""
+
+
+class ConfigUpdateReq(BaseModel):
+    lots: Optional[int] = None
+    sl_pct: Optional[float] = None
+    combined_sl_pct: Optional[float] = None
+    sl_to_cost: Optional[bool] = None
+    target_pct: Optional[float] = None
+    strike_offset: Optional[int] = None
+    strategy_type: Optional[str] = None  # "straddle" | "strangle"
+    entry_time: Optional[str] = None     # "HH:MM"
+    squareoff_time: Optional[str] = None # "HH:MM"
+
+
+@app.post("/api/config")
+def update_config(req: ConfigUpdateReq) -> JSONResponse:
+    """Update runtime strategy parameters from the dashboard.
+
+    Changes take effect on the NEXT session start. If a session is already
+    running, lots cannot be changed mid-position (would desync qty), but SL %
+    and strategy type are noted for next start.
+    """
+    changes = {}
+    if req.lots is not None:
+        if req.lots < 1 or req.lots > settings.max_lots:
+            return JSONResponse(
+                {"ok": False, "reason": f"lots must be 1–{settings.max_lots}"},
+                status_code=400)
+        runtime_overrides["lots"] = req.lots
+        changes["lots"] = req.lots
+
+    if req.sl_pct is not None:
+        # Accept 0 to disable, or a positive decimal (e.g. 0.30 = 30%)
+        if req.sl_pct < 0 or req.sl_pct > 5.0:
+            return JSONResponse(
+                {"ok": False, "reason": "sl_pct must be 0–5.0 (0=disabled, 0.30=30%)"},
+                status_code=400)
+        runtime_overrides["sl_pct"] = req.sl_pct if req.sl_pct > 0 else None
+        changes["sl_pct"] = req.sl_pct
+
+    if req.combined_sl_pct is not None:
+        if req.combined_sl_pct < 0 or req.combined_sl_pct > 5.0:
+            return JSONResponse(
+                {"ok": False, "reason": "combined_sl_pct must be 0–5.0"},
+                status_code=400)
+        runtime_overrides["combined_sl_pct"] = req.combined_sl_pct if req.combined_sl_pct > 0 else None
+        changes["combined_sl_pct"] = req.combined_sl_pct
+
+    if req.sl_to_cost is not None:
+        runtime_overrides["sl_to_cost"] = req.sl_to_cost
+        changes["sl_to_cost"] = req.sl_to_cost
+
+    if req.target_pct is not None:
+        runtime_overrides["target_pct"] = req.target_pct if req.target_pct > 0 else None
+        changes["target_pct"] = req.target_pct
+
+    if req.strategy_type is not None:
+        if req.strategy_type == "strangle":
+            runtime_overrides["strike_offset"] = runtime_overrides.get("strike_offset", 1) or 1
+        elif req.strategy_type == "straddle":
+            runtime_overrides["strike_offset"] = 0
+        changes["strategy_type"] = req.strategy_type
+
+    if req.strike_offset is not None:
+        if req.strike_offset < 0 or req.strike_offset > 10:
+            return JSONResponse(
+                {"ok": False, "reason": "strike_offset must be 0–10"},
+                status_code=400)
+        runtime_overrides["strike_offset"] = req.strike_offset
+        changes["strike_offset"] = req.strike_offset
+
+    import datetime as _dt
+    for _field, _key in [(req.entry_time, "entry_time"),
+                         (req.squareoff_time, "squareoff_time")]:
+        if _field is not None:
+            try:
+                hh, mm = _field.strip().split(":")
+                _dt.time(int(hh), int(mm))  # validate
+                runtime_overrides[_key] = _field.strip()
+                changes[_key] = _field.strip()
+            except (ValueError, AttributeError):
+                return JSONResponse(
+                    {"ok": False, "reason": f"{_key} must be HH:MM"},
+                    status_code=400)
+
+    log.info("Runtime config updated: %s", changes)
+    _save_overrides()
+    return JSONResponse({"ok": True, "changes": changes,
+                         "overrides": dict(runtime_overrides)})
 
 
 @app.get("/api/journal")
@@ -252,6 +395,51 @@ def login_with_code(req: LoginCodeReq) -> JSONResponse:
     except Exception as e:
         log.exception("Token exchange failed")
         return JSONResponse({"ok": False, "reason": str(e)}, status_code=400)
+
+
+@app.post("/api/server/restart")
+def restart_server() -> JSONResponse:
+    """Restarts the server process cleanly in the background."""
+    import subprocess
+    import os
+    from pathlib import Path
+
+    current_pid = os.getpid()
+    log.warning("Server restart requested via API (PID %d)", current_pid)
+    
+    ps_script = Path(__file__).resolve().parent.parent / "scripts" / "restart_helper.ps1"
+    
+    DETACHED_PROCESS = 0x00000008
+    CREATE_NEW_PROCESS_GROUP = 0x00000200
+    flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+
+    cmd = [
+        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+        "-File", str(ps_script), "-PidToKill", str(current_pid)
+    ]
+    subprocess.Popen(
+        cmd,
+        creationflags=flags,
+        close_fds=True,
+    )
+    return JSONResponse({"ok": True, "message": "Server restarting in background..."})
+
+
+@app.post("/api/server/shutdown")
+def shutdown_server() -> JSONResponse:
+    """Kills / terminates the server process cleanly."""
+    import subprocess
+    import os
+
+    current_pid = os.getpid()
+    log.warning("Server shutdown requested via API (PID %d)", current_pid)
+
+    DETACHED_PROCESS = 0x00000008
+    flags = DETACHED_PROCESS
+
+    cmd = f"ping 127.0.0.1 -n 2 >nul & taskkill /F /PID {current_pid}"
+    subprocess.Popen(["cmd.exe", "/c", cmd], creationflags=flags, close_fds=True)
+    return JSONResponse({"ok": True, "message": "Server shutting down..."})
 
 
 

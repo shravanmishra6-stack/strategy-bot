@@ -49,6 +49,8 @@ class PaperMode(RuntimeError):
 # never a fill attempt.
 ALLOWED_LIVE_PRICE_TYPE = "LMT"
 REJECTED_LIVE_PRICE_TYPES = ("MKT", "SL-M", "SLM")
+# SL-LMT is accepted by Shoonya for API orders (trigger_price + limit_price)
+ALLOWED_SL_PRICE_TYPE = "SL-LMT"
 
 
 class RateLimiter:
@@ -237,6 +239,8 @@ class ShoonyaClient:
                     raise
                 if attempt < retries:
                     time.sleep(0.5 * (2**attempt))
+        if last_err is None:
+            raise BrokerError(f"{method_name} failed with no response")
         raise last_err  # pragma: no cover - loop always returns or raises
 
     # --- account / books (read-only) ----------------------------------------
@@ -313,6 +317,61 @@ class ShoonyaClient:
         if not self.live_armed:
             raise PaperMode("REFUSED cancel_order: not armed for live trading")
         return self._call("cancel_order", orderno)
+
+    def place_sl_order(self, *, buy_or_sell: str, product_type: str, exchange: str,
+                       tradingsymbol: str, quantity: int,
+                       trigger_price: float, limit_price: float,
+                       retention: str = "DAY", remarks: str = "sl_bot") -> dict | None:
+        """Place a Stop-Loss Limit (SL-LMT) order at the broker.
+
+        For a short option SL: BUY back when price rises to trigger_price.
+        The limit_price is set slightly above trigger_price to guarantee fill
+        (exchange fills at best available price up to limit_price).
+        Returns the broker's order dict (with norenordno) or raises.
+        """
+        if not self.live_armed:
+            raise PaperMode(
+                f"REFUSED place_sl_order {buy_or_sell} {tradingsymbol}: not armed"
+            )
+        log.warning(
+            "LIVE SL ORDER -> %s %s %s x%d trigger=%.2f limit=%.2f (SL-LMT)",
+            buy_or_sell, exchange, tradingsymbol, quantity, trigger_price, limit_price,
+        )
+        return self._call(
+            "place_order",
+            buy_or_sell=buy_or_sell,
+            product_type=product_type,
+            exchange=exchange,
+            tradingsymbol=tradingsymbol,
+            quantity=quantity,
+            discloseqty=0,
+            price_type="SL-LMT",
+            price=limit_price,
+            trigger_price=trigger_price,
+            retention=retention,
+            amo="NO",
+            remarks=remarks,
+        )
+
+    def modify_sl_order(self, *, orderno: str, exchange: str, tradingsymbol: str,
+                        quantity: int, trigger_price: float, limit_price: float) -> dict | None:
+        """Modify an existing SL-LMT order (e.g. move SL to cost price)."""
+        if not self.live_armed:
+            raise PaperMode("REFUSED modify_sl_order: not armed for live trading")
+        log.warning(
+            "MODIFY SL ORDER %s -> trigger=%.2f limit=%.2f",
+            orderno, trigger_price, limit_price,
+        )
+        return self._call(
+            "modify_order",
+            orderno=orderno,
+            exchange=exchange,
+            tradingsymbol=tradingsymbol,
+            newquantity=quantity,
+            newprice_type="SL-LMT",
+            newprice=limit_price,
+            newtrigger_price=trigger_price,
+        )
 
     # --- websocket -----------------------------------------------------------
     def start_websocket(self, *, on_quote, on_order_update, on_open=None,

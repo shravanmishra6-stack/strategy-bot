@@ -92,7 +92,100 @@ class ExecutionEngine:
                           ref_price=ref_price, token=token, symbol=symbol,
                           exchange=exchange, reason=reason, ts=ts)
 
-    # --- core ----------------------------------------------------------------
+    def place_broker_sl(self, *, right: str, strike: int, qty: int,
+                        sl_trigger: float, token: str | None = None,
+                        symbol: str | None = None, exchange: str | None = None,
+                        tag: str | None = None) -> str | None:
+        """Place a SL-LMT BUY order at the broker for a short leg.
+
+        For short options the SL fires when price RISES above sl_trigger.
+        Limit price = trigger * 1.10 (10% buffer) to guarantee fill.
+        Returns broker order ID, or None in paper mode.
+        """
+        tick = float(getattr(settings, "order_tick_size", 0.05)) or 0.05
+        import math
+        # Limit is 10% above trigger (same buffer as aggressive market limit)
+        raw_limit = sl_trigger * 1.10
+        limit_px = round(math.ceil(raw_limit / tick) * tick, 2)
+        tag = tag or f"{right}{strike}-SL-{uuid.uuid4().hex[:8]}"
+        exch = exchange or settings.fno_exchange
+
+        if self.paper_mode:
+            log.info("PAPER SL ORDER %s %s trigger=%.2f limit=%.2f (not sent to broker)",
+                     right, symbol or f"{right}{strike}", sl_trigger, limit_px)
+            return None
+
+        if not getattr(self.client, "live_armed", False):
+            log.warning("SL order skipped: client not armed")
+            return None
+        if not symbol or not token:
+            log.warning("SL order skipped: incomplete instrument (symbol=%r token=%r)", symbol, token)
+            return None
+
+        try:
+            resp = self.client.place_sl_order(
+                buy_or_sell="B",
+                product_type=self.product_type,
+                exchange=exch,
+                tradingsymbol=symbol,
+                quantity=qty,
+                trigger_price=sl_trigger,
+                limit_price=limit_px,
+                remarks=tag,
+            )
+            if resp and resp.get("norenordno"):
+                orderno = resp["norenordno"]
+                log.warning("BROKER SL ORDER PLACED %s %s trigger=%.2f -> orderno=%s",
+                            right, symbol, sl_trigger, orderno)
+                return orderno
+            else:
+                log.error("Broker SL order for %s returned no orderno: %s", symbol, resp)
+                return None
+        except Exception as e:
+            log.error("Failed to place broker SL order for %s: %s", symbol, e)
+            return None
+
+    def cancel_broker_sl(self, orderno: str, symbol: str = "") -> bool:
+        """Cancel an existing broker SL order (e.g. when leg closes via bar-SL or squareoff)."""
+        if self.paper_mode or not getattr(self.client, "live_armed", False):
+            return False
+        try:
+            self.client.cancel_order(orderno)
+            log.info("Cancelled broker SL order %s (%s)", orderno, symbol)
+            return True
+        except Exception as e:
+            log.error("Failed to cancel broker SL order %s: %s", orderno, e)
+            return False
+
+    def modify_broker_sl(self, *, orderno: str, right: str, qty: int,
+                         new_trigger: float, symbol: str | None = None,
+                         exchange: str | None = None) -> bool:
+        """Modify an existing SL-LMT order to a new trigger price (e.g. SL-to-cost)."""
+        tick = float(getattr(settings, "order_tick_size", 0.05)) or 0.05
+        import math
+        raw_limit = new_trigger * 1.10
+        new_limit = round(math.ceil(raw_limit / tick) * tick, 2)
+        exch = exchange or settings.fno_exchange
+        if self.paper_mode or not getattr(self.client, "live_armed", False):
+            log.info("PAPER MODIFY SL %s %s new_trigger=%.2f (not sent)", orderno, symbol, new_trigger)
+            return False
+        try:
+            self.client.modify_sl_order(
+                orderno=orderno,
+                exchange=exch,
+                tradingsymbol=symbol or "",
+                quantity=qty,
+                trigger_price=new_trigger,
+                limit_price=new_limit,
+            )
+            log.warning("BROKER SL MODIFIED %s %s new_trigger=%.2f new_limit=%.2f",
+                        orderno, symbol, new_trigger, new_limit)
+            return True
+        except Exception as e:
+            log.error("Failed to modify broker SL order %s: %s", orderno, e)
+            return False
+
+
     def _limit_price(self, action: str, ref_price: float, is_exit: bool = False) -> float:
         """Marketable limit price for one order.
 
