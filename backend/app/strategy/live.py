@@ -292,17 +292,19 @@ class LiveStraddle:
         if ce_leg and pe_leg and ce_leg.entry is not None and pe_leg.entry is not None:
             self.combined_entry = round(float(ce_leg.entry + pe_leg.entry), 4)
             if self.params.combined_sl_pct is not None:
-                comb_sl = round(self.combined_entry * float(self.params.combined_sl_pct), 2)
-                self.combined_sl_level = comb_sl
-                ce_leg.sl_level = comb_sl
-                pe_leg.sl_level = comb_sl
-        log.info("ENTERED straddle CE%d/PE%d x%s @ %s (combined entry=%.2f, leg SL=%s)",
+                comb_pts = round(self.combined_entry * float(self.params.combined_sl_pct), 2)
+                self.combined_sl_level = round(self.combined_entry + comb_pts, 2)
+        log.info("ENTERED straddle CE%d/PE%d x%s @ %s (combined entry=%.2f, combined SL level=%s)",
                  atm, want_pe, dict(self._order_qty), ts.strftime("%H:%M:%S"),
                  self.combined_entry or 0.0,
                  f"{self.combined_sl_level:.2f}" if self.combined_sl_level else "none")
-        # Place broker-side SL-LMT orders immediately after entry so the exchange
-        # enforces the stop without relying on our polling loop.
-        self._place_broker_sl_orders()
+        # Stop-loss is enforced in memory by default. Broker SL orders are only placed
+        # if broker_sl_enabled is True.
+        if getattr(settings, "broker_sl_enabled", False):
+            self._place_broker_sl_orders()
+        else:
+            log.info("SL kept in memory only (not placed to broker) for %s",
+                     f"combined SL {self.combined_sl_level:.2f}" if self.combined_sl_level else "legs")
 
     def _send_leg(self, right: str, px: float, ts: dt.datetime) -> None:
         """Submit one leg's opening sell and arm its exit rules."""
@@ -317,10 +319,11 @@ class LiveStraddle:
     def _place_broker_sl_orders(self) -> None:
         """Place SL-LMT BUY orders at the broker for every open leg.
 
-        Called once after entry. The broker holds these orders and the exchange
-        triggers them automatically — no polling required. In-memory SL checks
-        remain as a backup in case the broker order lags or is rejected.
+        By default, SL is kept strictly in-memory and not sent to broker.
         """
+        if not getattr(settings, "broker_sl_enabled", False):
+            log.info("SL kept in memory only; skipping broker SL placement")
+            return
         if self._broker_sl_placed:
             return
         sl_level = self.combined_sl_level
@@ -358,13 +361,15 @@ class LiveStraddle:
     def _cancel_broker_sl(self, right: str) -> None:
         """Cancel broker SL order for one leg (called when leg exits by any path)."""
         orderno = self._broker_sl_orders.pop(right, None)
-        if orderno:
+        if orderno and getattr(settings, "broker_sl_enabled", False):
             inst = self.instruments.get(right)
             self.exec_engine.cancel_broker_sl(
                 orderno, symbol=inst.tradingsymbol if inst else "")
 
     def _modify_broker_sl_to_cost(self, right: str, cost: float) -> None:
         """Modify surviving leg's broker SL order to cost price (SL-to-cost)."""
+        if not getattr(settings, "broker_sl_enabled", False):
+            return
         orderno = self._broker_sl_orders.get(right)
         if not orderno:
             return
@@ -491,48 +496,78 @@ class LiveStraddle:
         comb_entry = getattr(self, "combined_entry", None)
         if comb_entry is None:
             return False
-        comb_sl = round(comb_entry * float(self.params.combined_sl_pct), 2)
+        comb_pts = round(comb_entry * float(self.params.combined_sl_pct), 2)
+        comb_sl = round(comb_entry + comb_pts, 2)
         self.combined_sl_level = comb_sl
 
-        hit = False
+        # 1) Track Total Premium across all legs (open live price + closed leg exit fill)
+        open_legs = [l for l in self.legs.values() if l.is_open]
+        if not open_legs:
+            return False
+
+        total_curr = 0.0
         for right, leg in self.legs.items():
-            if not leg.is_open:
-                continue
-            if getattr(self, "_sl_to_cost_active", False):
-                stop = leg.sl_level or leg.entry
+            if leg.is_open:
+                inst = self.instruments.get(right)
+                px = (self.last_price.get(inst.token) if inst else None) or leg.last_close or leg.entry
+                if px is None or px <= 0:
+                    return False
+                # Sanity guard: an option premium cannot be an index spot quote (> 2000 pts or > 10x entry)
+                if px > 2000.0 or (leg.entry and px > leg.entry * 10):
+                    log.error("Rejecting corrupt %s price %.2f (entry %.2f) in SL check", right, px, leg.entry or 0)
+                    return False
+                total_curr += px
             else:
-                if leg.sl_level is None or leg.sl_level != comb_sl:
-                    leg.sl_level = comb_sl
-                stop = leg.active_stop or comb_sl
-            inst = self.instruments.get(right)
-            px = (self.last_price.get(inst.token) if inst else None) or leg.last_close or leg.entry
-            if px is None or px <= 0:
-                continue
-            # Sanity guard: an option premium cannot be an index spot quote (> 2000 pts or > 10x entry)
-            if px > 2000.0 or (leg.entry and px > leg.entry * 10):
-                log.error("Rejecting corrupt %s price %.2f (entry %.2f) in SL check", right, px, leg.entry or 0)
-                continue
-            if stop is not None and px >= stop:
-                log.warning(
-                    "LEG SL HIT: %s price %.2f >= SL %.2f (rule SL: %.2f)",
-                    right, px, stop, comb_sl
-                )
-                self.exec_engine.buy_to_close(
-                    right=right, strike=inst.strike,
-                    qty=self._order_qty.get(right) or self._qty_for(inst),
-                    ref_price=px, reason=SL, token=inst.token,
-                    symbol=inst.tradingsymbol, exchange=inst.exchange, ts=ts,
-                )
-                leg.is_open = False
-                leg.last_close = px   # stamp exit fill so PnL is correct
-                # Cancel broker SL — leg already exited via in-memory SL check
-                self._cancel_broker_sl(right)
-                self._report_leg_close(right, px)
-                if self.params.sl_to_cost:
-                    self._move_surviving_legs_to_cost()
-                self._check_day_closed()
-                hit = True
-        return hit
+                total_curr += leg.last_close or leg.entry or 0.0
+
+        total_curr = round(total_curr, 2)
+        if total_curr >= comb_sl:
+            log.warning(
+                "COMBINED SL HIT: total premium %.2f >= SL %.2f (entry %.2f + %.2f pts SL)",
+                total_curr, comb_sl, comb_entry, comb_pts
+            )
+            for right, leg in list(self.legs.items()):
+                if leg.is_open:
+                    inst = self.instruments[right]
+                    px = (self.last_price.get(inst.token) if inst else None) or leg.last_close or leg.entry
+                    self.exec_engine.buy_to_close(
+                        right=right, strike=inst.strike,
+                        qty=self._order_qty.get(right) or self._qty_for(inst),
+                        ref_price=px, reason=COMBINED_SL, token=inst.token,
+                        symbol=inst.tradingsymbol, exchange=inst.exchange, ts=ts,
+                    )
+                    leg.is_open = False
+                    leg.last_close = px   # stamp exit fill so PnL is correct
+                    self._cancel_broker_sl(right)
+                    self._report_leg_close(right, px)
+            self._check_day_closed()
+            return True
+
+        # 2) If an individual leg had exited earlier and SL-to-cost is active on surviving leg:
+        if getattr(self, "_sl_to_cost_active", False):
+            for right, leg in list(self.legs.items()):
+                if not leg.is_open or leg.entry is None:
+                    continue
+                inst = self.instruments.get(right)
+                px = (self.last_price.get(inst.token) if inst else None) or leg.last_close or leg.entry
+                cost_stop = round(float(leg.entry), 2)
+                # Must actually rise above cost (with 0.05 tick margin to avoid firing at entry tick)
+                if px is not None and px > cost_stop + 0.05:
+                    log.warning("SURVIVING LEG SL-TO-COST HIT: %s price %.2f > cost %.2f", right, px, cost_stop)
+                    self.exec_engine.buy_to_close(
+                        right=right, strike=inst.strike,
+                        qty=self._order_qty.get(right) or self._qty_for(inst),
+                        ref_price=px, reason=SL, token=inst.token,
+                        symbol=inst.tradingsymbol, exchange=inst.exchange, ts=ts,
+                    )
+                    leg.is_open = False
+                    leg.last_close = px
+                    self._cancel_broker_sl(right)
+                    self._report_leg_close(right, px)
+                    self._check_day_closed()
+                    return True
+
+        return False
 
     def square_off(self, ts: dt.datetime) -> None:
         for right, leg in self.legs.items():

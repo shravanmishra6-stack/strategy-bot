@@ -102,8 +102,59 @@ function journal(s){
   $('b-journal-rebuild').disabled = !days.length;
 }
 
+let lastTelegramCheck = 0;
+async function updateTelegramPill() {
+  const now = Date.now();
+  if (now - lastTelegramCheck < 10000) return;
+  lastTelegramCheck = now;
+  try {
+    const res = await (await fetch('/api/telegram/status')).json();
+    const pill = $('telegram-pill');
+    if (!pill) return;
+    if (!res.configured) {
+      pill.textContent = '✈️ telegram: not set';
+      pill.className = 'pill';
+      pill.title = 'Telegram not configured. Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to backend/.env';
+    } else if (!res.enabled) {
+      pill.textContent = '✈️ telegram: disabled';
+      pill.className = 'pill';
+      pill.title = 'Telegram disabled in config';
+    } else if (res.last_error) {
+      pill.textContent = '✈️ telegram: warning';
+      pill.className = 'pill live';
+      pill.title = 'Telegram warning: ' + res.last_error + '. Click to test.';
+    } else {
+      pill.textContent = '✈️ telegram: active';
+      pill.className = 'pill paper';
+      pill.title = 'Telegram active. Click to send test alert.';
+    }
+  } catch (e) {}
+}
+
+const tgPill = $('telegram-pill');
+if (tgPill) {
+  tgPill.addEventListener('click', async () => {
+    try {
+      tgPill.textContent = '✈️ testing...';
+      const r = await fetch('/api/telegram/test', { method: 'POST' });
+      const d = await r.json();
+      if (d.ok) {
+        alert('✅ Telegram test notification sent successfully! Check your Telegram chat.');
+      } else {
+        alert('❌ Telegram test failed: ' + (d.message || 'unknown error'));
+      }
+    } catch (err) {
+      alert('❌ Failed to test Telegram: ' + err.message);
+    } finally {
+      lastTelegramCheck = 0;
+      updateTelegramPill();
+    }
+  });
+}
+
 async function refresh(){
   try{
+    updateTelegramPill();
     const s = await (await fetch('/api/status')).json();
 
     $('mode').textContent = s.paper_mode ? 'PAPER MODE' : 'LIVE MODE';
@@ -238,15 +289,16 @@ async function refresh(){
         $('comb-curr-val').textContent = `${currStr} on ${entStr} credit`;
         $('comb-curr-val').className = livePnlPts < 0 ? 'bad' : 'ok';
 
-        // Show broker SL order status
+        // Show SL status (in-memory or broker)
         const brokerSlOrders = s.broker_sl_orders || {};
         const slOrderIds = Object.entries(brokerSlOrders)
           .map(([r, id]) => `${r}:${id}`).join(', ');
         const slOrderBadge = slOrderIds
           ? ` 🟢 Broker SL @ exchange [${slOrderIds}]`
-          : ` ⚠️ In-memory SL only`;
-        $('comb-sl-val').textContent = `${slPtsStr} (${pctStr}% of ${entStr} credit)${slOrderBadge}`;
-        $('comb-sl-val').className = slOrderIds ? 'ok' : 'warn';
+          : ` 🛡️ In-memory SL (active)`;
+        const slLevelStr = (entVal != null && slPts != null) ? (entVal + slPts).toFixed(2) : slPtsStr;
+        $('comb-sl-val').textContent = `${slLevelStr} (+${slPtsStr} pts / ${pctStr}% of ${entStr} credit)${slOrderBadge}`;
+        $('comb-sl-val').className = 'ok';
 
         const ceOpen = s.legs?.CE?.is_open;
         const peOpen = s.legs?.PE?.is_open;

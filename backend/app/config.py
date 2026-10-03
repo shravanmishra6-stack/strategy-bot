@@ -86,6 +86,12 @@ class Settings:
             "SHOONYA_WEBSOCKET", "wss://api.shoonya.com/NorenWSAPI/"
         )
     )
+    shoonya_password: str = field(
+        default_factory=lambda: os.getenv("SHOONYA_PASSWORD", "").strip()
+    )
+    shoonya_totp_key: str = field(
+        default_factory=lambda: os.getenv("SHOONYA_TOTP_KEY", "").strip()
+    )
 
     # --- Broker identities discovered from the LIVE API (read-only probes) -----
     # These were NOT guessed: 'NSE_FNO' is rejected by this account with
@@ -163,6 +169,10 @@ class Settings:
     strategy_sl_to_cost: bool = field(
         default_factory=lambda: _bool("STRATEGY_SL_TO_COST", True)
     )
+    # When False (default), stop-loss is kept strictly in-memory and NOT placed to the broker.
+    broker_sl_enabled: bool = field(
+        default_factory=lambda: _bool("BROKER_SL_ENABLED", False)
+    )
     strategy_target_pct: float | None = field(
         default_factory=lambda: (
             _float("STRATEGY_TARGET_PCT", 0.0)
@@ -217,9 +227,33 @@ class Settings:
         default_factory=lambda: _float("JOURNAL_BROKERAGE_PER_ORDER", 20.0)
     )
 
+    # --- Telegram Bot ---------------------------------------------------------
+    telegram_bot_token: str = field(
+        default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    )
+    telegram_chat_id: str = field(
+        default_factory=lambda: os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    )
+    telegram_enabled: bool = field(
+        default_factory=lambda: _bool("TELEGRAM_ENABLED", True)
+    )
+    telegram_heartbeat_mins: int = field(
+        default_factory=lambda: _int("TELEGRAM_HEARTBEAT_MINS", 30)
+    )
+
     @property
     def has_credentials(self) -> bool:
         return bool(self.access_token and self.uid and self.account_id)
+
+    @property
+    def has_auto_login_credentials(self) -> bool:
+        return bool(
+            (self.uid or self.client_id)
+            and self.shoonya_password
+            and self.shoonya_totp_key
+            and self.client_id
+            and self.secret_code
+        )
 
     @property
     def spot_dir(self) -> Path:

@@ -3,7 +3,7 @@ param(
 )
 
 $Port = 8000
-$BackendDir = "c:\Users\sharv\Projects\strategy-bot\backend"
+$BackendDir = Split-Path -Parent $PSScriptRoot
 Set-Location $BackendDir
 
 if ($PidToKill -gt 0) {
@@ -23,8 +23,14 @@ while ((Get-Date) -lt $deadline) {
 # Socket cooldown
 Start-Sleep -Milliseconds 800
 
-Start-Process -FilePath "py" `
-    -ArgumentList "-3.12", "-m", "uvicorn", "app.api:app", "--host", "127.0.0.1", "--port", "$Port" `
+$pythonBin = "python"
+$venvPython = Join-Path $BackendDir ".venv\Scripts\python.exe"
+if (Test-Path $venvPython) {
+    $pythonBin = $venvPython
+}
+
+Start-Process -FilePath $pythonBin `
+    -ArgumentList "-m", "uvicorn", "app.api:app", "--host", "127.0.0.1", "--port", "$Port" `
     -WorkingDirectory $BackendDir `
     -RedirectStandardOutput (Join-Path $BackendDir "runtime\server-restart.log") `
     -RedirectStandardError  (Join-Path $BackendDir "runtime\server-restart.err") `

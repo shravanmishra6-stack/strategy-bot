@@ -14,10 +14,16 @@ from app.strategy.params import StraddleParams
 class DummyClient:
     def __init__(self):
         self.orders = []
+        self.sl_orders = []
+        self.live_armed = True
 
     def place_order(self, **kwargs):
         self.orders.append(kwargs)
         return {"stat": "Ok", "norenordno": f"dummy_{len(self.orders)}"}
+
+    def place_sl_order(self, **kwargs):
+        self.sl_orders.append(kwargs)
+        return {"stat": "Ok", "norenordno": f"sl_{len(self.sl_orders)}"}
 
     def get_order_book(self):
         return []
@@ -41,8 +47,8 @@ def test_straddle_params_combined_sl():
     assert p2.sl_pct is None
 
 
-def test_live_straddle_combined_sl_triggers_individual_legs():
-    params = StraddleParams(sl_pct=None, combined_sl_pct=0.80, sl_to_cost=True, lots=1)
+def test_live_straddle_combined_sl_triggers_basket_exit():
+    params = StraddleParams(sl_pct=None, combined_sl_pct=0.50, sl_to_cost=True, lots=1)
     client = DummyClient()
     engine = ExecutionEngine(client, paper_mode=True)
     today = dt.date(2026, 9, 29)
@@ -61,48 +67,46 @@ def test_live_straddle_combined_sl_triggers_individual_legs():
 
     now = dt.datetime(2026, 9, 29, 9, 20, 0)
     # Spot arrives -> triggers ATM pinning and entry
-    strat.on_tick(now, "101", 60.0)
-    strat.on_tick(now, "102", 60.0)
+    strat.on_tick(now, "101", 145.15)
+    strat.on_tick(now, "102", 119.65)
     strat.on_tick(now, "26000", 22700.0)
 
     assert strat.phase == "IN_POSITION"
-    assert strat.combined_entry == 120.0
-    # Combined SL at 80% of 120 = 96.0
-    assert strat.combined_sl_level == 96.0
-    assert strat.legs["CE"].sl_level == 96.0
-    assert strat.legs["PE"].sl_level == 96.0
+    assert strat.combined_entry == 264.80
+    # Combined SL at 50% of 264.80 = 132.40 pts -> stop level = 264.80 + 132.40 = 397.20
+    assert strat.combined_sl_level == 397.20
     assert strat.legs["CE"].is_open is True
     assert strat.legs["PE"].is_open is True
 
-    # Tick 1: CE surges to 85 (< 96), PE drops to 50
-    # Neither leg crossed 96 -> both stay open
+    # Tick 1: CE is 146.05, PE is 119.65 -> Total = 265.70 (< 397.20)
+    # MUST stay open! (Previous bug triggered immediately here)
     tick1 = dt.datetime(2026, 9, 29, 9, 21, 0)
-    strat.on_tick(tick1, "101", 85.0)
-    strat.on_tick(tick1, "102", 50.0)
+    strat.on_tick(tick1, "101", 146.05)
+    strat.on_tick(tick1, "102", 119.65)
     assert strat.phase == "IN_POSITION"
     assert strat.legs["CE"].is_open is True
     assert strat.legs["PE"].is_open is True
 
-    # Tick 2: CE crosses 96 -> reaches 100!
-    # CE must trigger SL and exit! PE is still open at 50.
+    # Tick 2: CE surges to 200, PE drops to 80 -> Total = 280 (< 397.20)
+    # Winning leg decay cushions losing leg rise -> both stay open
     tick2 = dt.datetime(2026, 9, 29, 9, 22, 0)
-    strat.on_tick(tick2, "101", 100.0)
-    assert strat.legs["CE"].is_open is False
-    assert strat.legs["PE"].is_open is True
+    strat.on_tick(tick2, "101", 200.0)
+    strat.on_tick(tick2, "102", 80.0)
     assert strat.phase == "IN_POSITION"
-    # Surviving PE leg's SL must now be moved to its entry cost (60.0)!
-    assert strat.legs["PE"].sl_level == 60.0
+    assert strat.legs["CE"].is_open is True
+    assert strat.legs["PE"].is_open is True
 
-    # Tick 3: Later, PE rises to 60.50 (crosses its entry cost of 60.0!)
-    # PE now triggers SL at cost and exits.
+    # Tick 3: CE explodes to 320, PE is at 80 -> Total = 400 (>= 397.20)
+    # Total premium breached SL level! Combined SL triggers basket exit.
     tick3 = dt.datetime(2026, 9, 29, 9, 23, 0)
-    strat.on_tick(tick3, "102", 60.50)
+    strat.on_tick(tick3, "101", 320.0)
+    assert strat.legs["CE"].is_open is False
     assert strat.legs["PE"].is_open is False
     assert strat.phase == "DONE"
 
     fills = [f for f in engine.fills if f.action == "BUY"]
     assert len(fills) == 2
-    assert all(f.reason == "SL" for f in fills)
+    assert all(f.reason == COMBINED_SL for f in fills)
 
 
 def test_backtest_combined_sl():
@@ -114,21 +118,21 @@ def test_backtest_combined_sl():
         index=pd.to_datetime([f"{day} 09:20:00"]),
     )
 
-    # 09:20: CE=60, PE=60 (total=120, 80% SL level = 96 on each leg)
-    # 09:21: CE=85 (< 96), PE=50 (< 96) -> no exit
-    # 09:22: CE=100 (>= 96) -> CE SL exit! PE stays open
-    # 09:23: PE=98 (>= 96) -> PE SL exit!
+    # 09:20: CE=60, PE=60 (total=120, 80% SL level = 120 + 96 = 216 on total premium)
+    # 09:21: CE=85, PE=50 (total=135 < 216) -> no exit
+    # 09:22: CE=100, PE=52 (total=152 < 216) -> no exit
+    # 09:23: CE=120, PE=100 (total=220 >= 216) -> Combined SL exit!
     rows_ce = [
         ("09:20:00", 60.0, 61.0, 59.0, 60.0),
         ("09:21:00", 60.0, 86.0, 59.0, 85.0),
         ("09:22:00", 85.0, 102.0, 84.0, 100.0),
-        ("09:23:00", 100.0, 101.0, 99.0, 100.0),
+        ("09:23:00", 100.0, 121.0, 99.0, 120.0),
     ]
     rows_pe = [
         ("09:20:00", 60.0, 61.0, 59.0, 60.0),
         ("09:21:00", 60.0, 62.0, 49.0, 50.0),
         ("09:22:00", 50.0, 55.0, 48.0, 52.0),
-        ("09:23:00", 52.0, 99.0, 51.0, 98.0),
+        ("09:23:00", 52.0, 101.0, 51.0, 100.0),
     ]
     ce_df = pd.DataFrame(
         [[o, h, l, c] for _, o, h, l, c in rows_ce],
@@ -156,4 +160,67 @@ def test_backtest_combined_sl():
     assert res is not None
     assert res["legs_stopped"] == 2
     reasons = [row[5] for row in res["leg_details"]]
-    assert all(r == "SL" for r in reasons)
+    assert all(r == COMBINED_SL for r in reasons)
+
+
+def test_in_memory_sl_only_no_broker_sl_placed():
+    """Verify that in live trading, SL is kept strictly in memory:
+    - Zero SL-LMT orders are placed to the broker (place_sl_order not called).
+    - _broker_sl_orders remains empty.
+    - In-memory tick evaluation detects SL breach and sends buy_to_close order.
+    """
+    params = StraddleParams(sl_pct=None, combined_sl_pct=0.50, sl_to_cost=True, lots=1)
+    client = DummyClient()
+    # Live armed execution engine
+    engine = ExecutionEngine(client, paper_mode=False)
+    today = dt.date(2026, 9, 29)
+    risk = RiskManager()
+    risk.on_new_day(today)
+
+    strat = LiveStraddle(params=params, exec_engine=engine, risk=risk, date=today, lots=1)
+    ce_inst = LegInstrument(token="101", tradingsymbol="NIFTY22700CE", strike=22700, right="CE", lot_size=65)
+    pe_inst = LegInstrument(token="102", tradingsymbol="NIFTY22700PE", strike=22700, right="PE", lot_size=65)
+
+    pairs = [
+        (SoldLeg(right="CE", strike=22700, token="101", sl_pct=params.sl_pct), ce_inst),
+        (SoldLeg(right="PE", strike=22700, token="102", sl_pct=params.sl_pct), pe_inst),
+    ]
+    strat.configure(spot_token="26000", legs=pairs)
+
+    now = dt.datetime(2026, 9, 29, 9, 20, 0)
+    strat.on_tick(now, "101", 145.15)
+    strat.on_tick(now, "102", 119.65)
+    strat.on_tick(now, "26000", 22700.0)
+
+    assert strat.phase == "IN_POSITION"
+    assert strat.combined_entry == 264.80
+    assert strat.combined_sl_level == 397.20
+
+    # CRITICAL: Verify NO broker SL order was placed to broker!
+    assert len(client.sl_orders) == 0, "Broker SL orders must NOT be placed to broker"
+    assert strat._broker_sl_orders == {}, "In-memory SL tracking only"
+
+    # Opening sell orders were placed
+    assert len(client.orders) == 2
+    assert all(o["buy_or_sell"] == "S" for o in client.orders)
+
+    # Tick 1: CE is 146.05, PE is 119.65 -> Total = 265.70 (< 397.20)
+    # Stays open!
+    tick1 = dt.datetime(2026, 9, 29, 9, 21, 0)
+    strat.on_tick(tick1, "101", 146.05)
+    strat.on_tick(tick1, "102", 119.65)
+    assert strat.legs["CE"].is_open is True
+    assert strat.legs["PE"].is_open is True
+    assert len(client.orders) == 2
+
+    # Tick 2: CE surges to 320, PE is 80 -> Total = 400 (>= 397.20)
+    # In-memory combined SL fires! buy_to_close orders sent for both legs
+    tick2 = dt.datetime(2026, 9, 29, 9, 22, 0)
+    strat.on_tick(tick2, "101", 320.0)
+    assert strat.legs["CE"].is_open is False
+    assert strat.legs["PE"].is_open is False
+    assert strat.phase == "DONE"
+    assert len(client.orders) == 4
+    assert all(o["buy_or_sell"] == "B" for o in client.orders[2:])
+    assert len(client.sl_orders) == 0
+

@@ -1,0 +1,5 @@
+{
+  "python.terminal.useEnvFile": true,
+  "python.envFile": "${workspaceFolder}/backend/.env",
+  "python.defaultInterpreterPath": "${workspaceFolder}/backend/.venv/Scripts/python.exe"
+}

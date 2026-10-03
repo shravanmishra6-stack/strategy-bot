@@ -8,8 +8,9 @@
 #   * idempotent: reuses an already-running server instead of stacking copies
 param(
     [string]$Port = "8000",
-    [switch]$Arm   # off by default; pass -Arm only if you intentionally want
-                   # an unattended armed session
+    [switch]$Arm,   # off by default; pass -Arm only if you intentionally want
+                    # an unattended armed session
+    [switch]$Force  # off by default; pass -Force to bypass the weekend guard
 )
 $ErrorActionPreference = "Stop"
 $backend = Split-Path -Parent $PSScriptRoot   # .../backend
@@ -19,10 +20,15 @@ $log = Join-Path $backend "runtime"
 New-Item -ItemType Directory -Force -Path $log | Out-Null
 $stamp = Get-Date -Format "yyyy-MM-dd"
 
-# Weekend guard - do not even start the process.
+# Weekend guard - do not even start the process unless -Force is supplied.
 if ((Get-Date).DayOfWeek -in @("Saturday", "Sunday")) {
-    Add-Content (Join-Path $log "scheduler.log") "$stamp skipped: weekend"
-    exit 0
+    if (-not $Force) {
+        $msg = "$stamp skipped: weekend (pass -Force to override)"
+        Add-Content (Join-Path $log "scheduler.log") $msg
+        Write-Host $msg
+        exit 0
+    }
+    Write-Host "$stamp weekend guard bypassed (-Force)"
 }
 
 function Test-Port([int]$p) {
@@ -45,9 +51,16 @@ function Test-Port([int]$p) {
     } catch { return $false }
 }
 
+$pythonBin = "python"
+$venvPython = Join-Path $backend ".venv\Scripts\python.exe"
+if (Test-Path $venvPython) {
+    $pythonBin = $venvPython
+}
+
 if (-not (Test-Port $Port)) {
-    Start-Process -FilePath python -ArgumentList "-m","uvicorn","app.api:app",
+    Start-Process -FilePath $pythonBin -ArgumentList "-m","uvicorn","app.api:app",
         "--host","127.0.0.1","--port",$Port `
+        -WorkingDirectory $backend `
         -RedirectStandardOutput (Join-Path $log "server-$stamp.log") `
         -RedirectStandardError  (Join-Path $log "server-$stamp.err") `
         -WindowStyle Hidden
@@ -62,6 +75,7 @@ try {
     try {
         Invoke-RestMethod -Method Post -Uri "$base/api/start" -TimeoutSec 15 | Out-Null
         Add-Content $schedLog "$stamp session started (arm=$Arm)"
+        Write-Host "$stamp session started (arm=$Arm)"
     } catch {
         # A 409 means a session is ALREADY running: that is the desired end
         # state, not a failure. It must not skip the -Arm call below (previously
@@ -69,6 +83,7 @@ try {
         $code = $_.Exception.Response.StatusCode.value__
         if ($code -eq 409) {
             Add-Content $schedLog "$stamp session already running (arm=$Arm)"
+            Write-Host "$stamp session already running (arm=$Arm)"
         } else {
             throw
         }
@@ -76,9 +91,13 @@ try {
     if ($Arm) {
         Invoke-RestMethod -Method Post -Uri "$base/api/arm" -TimeoutSec 15 | Out-Null
         Add-Content $schedLog "$stamp ARMED live trading"
+        Write-Host "$stamp ARMED live trading"
     }
+    Write-Host "Server is running at $base"
     exit 0
 } catch {
     Add-Content $schedLog "$stamp FAILED: $($_.Exception.Message)"
+    Write-Error "$stamp FAILED: $($_.Exception.Message)"
     exit 1
 }
+

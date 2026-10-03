@@ -93,9 +93,8 @@ def backtest_one_day(
     if p.combined_sl_pct is not None:
         entries = [box["leg"].entry for box in legs.values() if box["leg"].entry is not None]
         if len(entries) == len(legs):
-            comb_sl = round(sum(entries) * p.combined_sl_pct, 2)
-            for box in legs.values():
-                box["leg"].sl_level = comb_sl
+            comb_pts = round(sum(entries) * p.combined_sl_pct, 2)
+            comb_sl = round(sum(entries) + comb_pts, 2)
 
     exits = []
     for ts in timeline:
@@ -112,6 +111,34 @@ def backtest_one_day(
                     exits.append((right, ts, px, reason))
                     leg.is_open = False
             break
+
+        if comb_sl is not None and any(box["leg"].is_open for box in legs.values()):
+            tot_high = sum(
+                (
+                    _clean_price(box["df"].loc[ts, "high"], box["leg"].last_close)
+                    if ts in box["df"].index
+                    else box["leg"].last_close
+                )
+                for right, box in legs.items()
+            )
+            if tot_high >= comb_sl:
+                tot_open = sum(
+                    (
+                        _clean_price(box["df"].loc[ts, "open"], box["leg"].last_close)
+                        if ts in box["df"].index
+                        else box["leg"].last_close
+                    )
+                    for right, box in legs.items()
+                )
+                for right, box in legs.items():
+                    leg, df = box["leg"], box["df"]
+                    if leg.is_open:
+                        open_px = _clean_price(df.loc[ts, "open"], leg.last_close) if ts in df.index else leg.last_close
+                        high_px = _clean_price(df.loc[ts, "high"], leg.last_close) if ts in df.index else leg.last_close
+                        px = open_px if tot_open >= comb_sl else high_px
+                        exits.append((right, ts, px, COMBINED_SL))
+                        leg.is_open = False
+                break
 
 
         for right, box in legs.items():

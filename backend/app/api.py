@@ -34,7 +34,27 @@ FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 XLSX_MIME = ("application/vnd.openxmlformats-officedocument"
              ".spreadsheetml.sheet")
 
-app = FastAPI(title="Strategy Bot", version="1.0")
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(app_inst: FastAPI):
+    from app.telegram_bot import telegram_bot
+    telegram_bot.init(
+        state=_state,
+        start_fn=start,
+        stop_fn=stop,
+        arm_fn=arm,
+        disarm_fn=disarm,
+    )
+    telegram_bot.start()
+    try:
+        yield
+    finally:
+        telegram_bot.stop()
+
+
+app = FastAPI(title="Strategy Bot", version="1.0", lifespan=lifespan)
 
 _state = SessionState()
 _stop = threading.Event()
@@ -84,11 +104,9 @@ def status() -> dict:
     comb_pct = comb.get("sl_pct") if comb.get("sl_pct") is not None else settings.strategy_combined_sl_pct
     comb_ent = comb.get("entry")
     if comb_pct is not None and comb_ent is not None:
-        target_sl = round(comb_ent * comb_pct, 2)
-        comb["sl_level"] = target_sl
-        for leg in (snap.get("legs") or {}).values():
-            if leg.get("sl_level") is None:
-                leg["sl_level"] = target_sl
+        comb_pts = round(comb_ent * comb_pct, 2)
+        comb["sl_pts"] = comb_pts
+        comb["sl_level"] = round(comb_ent + comb_pts, 2)
     snap["config"] = {
         "max_daily_loss_pts": settings.max_daily_loss_pts,
         "max_lots": settings.max_lots,
@@ -397,6 +415,25 @@ def login_with_code(req: LoginCodeReq) -> JSONResponse:
         return JSONResponse({"ok": False, "reason": str(e)}, status_code=400)
 
 
+@app.post("/api/login/auto")
+def login_auto() -> JSONResponse:
+    """Run automated zero-touch login via Playwright & TOTP."""
+    from app.broker.auto_login import perform_auto_login
+    try:
+        res = perform_auto_login()
+        return JSONResponse({
+            "ok": True,
+            "message": "Automated login completed successfully!",
+            "uid": res["uid"],
+            "account_id": res["account_id"],
+            "session_ok": res["session_ok"],
+            "limits": res.get("limits"),
+        })
+    except Exception as e:
+        log.exception("Automated login failed")
+        return JSONResponse({"ok": False, "reason": str(e)}, status_code=400)
+
+
 @app.post("/api/server/restart")
 def restart_server() -> JSONResponse:
     """Restarts the server process cleanly in the background."""
@@ -440,6 +477,20 @@ def shutdown_server() -> JSONResponse:
     cmd = f"ping 127.0.0.1 -n 2 >nul & taskkill /F /PID {current_pid}"
     subprocess.Popen(["cmd.exe", "/c", cmd], creationflags=flags, close_fds=True)
     return JSONResponse({"ok": True, "message": "Server shutting down..."})
+
+
+@app.get("/api/telegram/status")
+def telegram_status() -> dict:
+    from app.telegram_bot import telegram_bot
+    return telegram_bot.status_dict()
+
+
+@app.post("/api/telegram/test")
+def telegram_test() -> JSONResponse:
+    from app.telegram_bot import telegram_bot
+    ok, msg = telegram_bot.send_test_message()
+    return JSONResponse({"ok": ok, "message": msg}, status_code=200 if ok else 400)
+
 
 
 

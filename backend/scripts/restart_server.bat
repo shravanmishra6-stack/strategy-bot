@@ -6,5 +6,5 @@ if not "%PID_TO_KILL%"=="" (
     taskkill /F /PID %PID_TO_KILL% >nul 2>&1
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "c:\Users\sharv\Projects\strategy-bot\backend\scripts\restart_helper.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0restart_helper.ps1"
 exit /b 0

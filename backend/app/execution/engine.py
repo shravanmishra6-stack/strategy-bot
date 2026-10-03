@@ -115,6 +115,11 @@ class ExecutionEngine:
                      right, symbol or f"{right}{strike}", sl_trigger, limit_px)
             return None
 
+        if not getattr(settings, "broker_sl_enabled", False):
+            log.info("SL kept in memory only; broker SL order skipped for %s %s trigger=%.2f",
+                     right, symbol or f"{right}{strike}", sl_trigger)
+            return None
+
         if not getattr(self.client, "live_armed", False):
             log.warning("SL order skipped: client not armed")
             return None
@@ -147,6 +152,8 @@ class ExecutionEngine:
 
     def cancel_broker_sl(self, orderno: str, symbol: str = "") -> bool:
         """Cancel an existing broker SL order (e.g. when leg closes via bar-SL or squareoff)."""
+        if not getattr(settings, "broker_sl_enabled", False):
+            return False
         if self.paper_mode or not getattr(self.client, "live_armed", False):
             return False
         try:
@@ -161,6 +168,8 @@ class ExecutionEngine:
                          new_trigger: float, symbol: str | None = None,
                          exchange: str | None = None) -> bool:
         """Modify an existing SL-LMT order to a new trigger price (e.g. SL-to-cost)."""
+        if not getattr(settings, "broker_sl_enabled", False):
+            return False
         tick = float(getattr(settings, "order_tick_size", 0.05)) or 0.05
         import math
         raw_limit = new_trigger * 1.10

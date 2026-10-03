@@ -62,6 +62,7 @@ class SessionState:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._listeners: list = []
         self._data: dict = {
             "status": "idle",
             "day": None,
@@ -87,11 +88,29 @@ class SessionState:
             "pnl_history": [],
         }
 
+    def add_listener(self, cb) -> None:
+        with self._lock:
+            if cb not in self._listeners:
+                self._listeners.append(cb)
+
+    def remove_listener(self, cb) -> None:
+        with self._lock:
+            if cb in self._listeners:
+                self._listeners.remove(cb)
+
     def update(self, **kw) -> None:
         with self._lock:
+            old_snap = dict(self._data)
             self._data.update(kw)
             self._data["updated_at"] = dt.datetime.now().isoformat(
                 sep=" ", timespec="seconds")
+            new_snap = dict(self._data)
+            listeners = list(self._listeners)
+        for cb in listeners:
+            try:
+                cb(old_snap, new_snap, kw)
+            except Exception as e:
+                log.warning("SessionState listener error: %s", e)
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -392,13 +411,8 @@ def _run_day(*, st: SessionState, stop: threading.Event, today: dt.date,
             log.warning("quote poll failed: %s", e)
 
         if strat.params.combined_sl_pct is not None and getattr(strat, "combined_entry", None):
-            comb_sl = round(strat.combined_entry * float(strat.params.combined_sl_pct), 2)
-            strat.combined_sl_level = comb_sl
-            for l in strat.legs.values():
-                if getattr(strat, "_sl_to_cost_active", False):
-                    continue
-                if l.sl_level is None or l.sl_level != comb_sl:
-                    l.sl_level = comb_sl
+            comb_pts = round(strat.combined_entry * float(strat.params.combined_sl_pct), 2)
+            strat.combined_sl_level = round(strat.combined_entry + comb_pts, 2)
 
         st.update(phase=strat.phase,
                   spot=strat.spot_ref or day["spot"],
