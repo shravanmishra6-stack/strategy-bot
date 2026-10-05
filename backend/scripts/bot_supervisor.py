@@ -34,6 +34,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from app.config import settings
+from app.telegram_pnl import compute_session_stats, format_spot_line
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,6 +58,7 @@ class TelegramSupervisor:
         self.chat_id = settings.telegram_chat_id.strip()
         self.api_base = f"https://api.telegram.org/bot{self.token}" if self.token else ""
         self.last_update_id = 0
+        self._last_heartbeat = time.time()
         self._http = httpx.Client(timeout=10.0)
 
     def is_configured(self) -> bool:
@@ -82,6 +84,51 @@ class TelegramSupervisor:
         except Exception as e:
             log.warning("Telegram send failed: %s", e)
             return False
+
+    def check_heartbeat(self) -> None:
+        """Send periodic heartbeat while IN_POSITION."""
+        mins = getattr(settings, "telegram_heartbeat_mins", 15) or 15
+        interval_secs = max(60, int(mins) * 60)
+        now = time.time()
+        if now - self._last_heartbeat < interval_secs:
+            return
+
+        st = self.get_server_status()
+        if not st or st.get("phase") != "IN_POSITION":
+            return
+
+        self._last_heartbeat = now
+        stats = compute_session_stats(st)
+        ce = stats["legs"].get("CE", {})
+        pe = stats["legs"].get("PE", {})
+        ce_ltp = ce.get("ltp")
+        pe_ltp = pe.get("ltp")
+        ce_str = f"{ce_ltp:.2f}" if ce_ltp is not None else "-"
+        pe_str = f"{pe_ltp:.2f}" if pe_ltp is not None else "-"
+
+        open_pts = stats["open_pts"]
+        open_rs = stats["open_rs"]
+        tot_pts = stats["total_pts"]
+        tot_rs = stats["total_rs"]
+        pnl_icon = "🟢" if open_pts >= 0 else "🔴"
+        sign = "+" if open_pts >= 0 else ""
+        tot_sign = "+" if tot_pts >= 0 else ""
+
+        spot = st.get("spot")
+        atm = st.get("atm")
+        spot_str = f"{spot:,.2f}" if spot else "-"
+        atm_str = str(atm) if atm else "-"
+
+        time_now = dt.datetime.now().strftime("%H:%M")
+        spot_header = format_spot_line(stats, atm)
+        msg = (
+            f"📊 <b>Heartbeat Update ({time_now})</b>\n"
+            f"{spot_header}\n"
+            f"🔵 CE LTP: <b>{ce_str}</b> | 🔴 PE LTP: <b>{pe_str}</b>\n"
+            f"{pnl_icon} Position P&L: <b>{sign}{open_pts:.2f} pts</b> ({sign}₹{open_rs:,.2f})\n"
+            f"💼 Day Total P&L: <b>{tot_sign}{tot_pts:.2f} pts</b> ({tot_sign}₹{tot_rs:,.2f})"
+        )
+        self.send_message(msg)
 
     # --- Server Process Helpers ------------------------------------------------
 
@@ -260,22 +307,23 @@ class TelegramSupervisor:
         spot_str = f"{spot:,.2f}" if spot else "N/A"
         atm_str = str(atm) if atm else "N/A"
 
-        risk = st.get("risk", {})
-        daily_rs = risk.get("daily_pnl_rupees", 0.0)
-        daily_pts = risk.get("daily_pnl_pts", 0.0)
-        sign = "+" if daily_pts >= 0 else ""
-
-        comb = st.get("combined", {})
-        comb_pnl_pts = comb.get("pnl_pts", 0.0)
+        stats = compute_session_stats(st)
+        pos_pts = stats["open_pts"]
+        pos_rs = stats["open_rs"]
+        tot_pts = stats["total_pts"]
+        tot_rs = stats["total_rs"]
+        pos_sign = "+" if pos_pts >= 0 else ""
+        tot_sign = "+" if tot_pts >= 0 else ""
+        spot_header = format_spot_line(stats, atm)
 
         msg = (
             "📊 <b>Bot Status Overview</b>\n"
             f"🟢 Server: <b>ONLINE</b> (Port {PORT})\n"
             f"⚙️ State: <b>{_esc(status).upper()}</b> | Phase: <b>{_esc(phase)}</b>\n"
             f"🛡️ Mode: <b>{mode_str}</b>\n"
-            f"📈 Spot: <b>{spot_str}</b> | ATM: <b>{atm_str}</b> | Lots: <b>{lots}</b>\n\n"
-            f"💰 Position P&L: <b>{comb_pnl_pts:+.2f} pts</b>\n"
-            f"💼 Day Total P&L: <b>{sign}{daily_pts:.2f} pts</b> ({sign}₹{daily_rs:,.2f})\n\n"
+            f"{spot_header} | Lots: <b>{lots}</b>\n\n"
+            f"💰 Position P&L: <b>{pos_sign}{pos_pts:.2f} pts</b> ({pos_sign}₹{pos_rs:,.2f})\n"
+            f"💼 Day Total P&L: <b>{tot_sign}{tot_pts:.2f} pts</b> ({tot_sign}₹{tot_rs:,.2f})\n\n"
             f"⏰ <code>{dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
         )
         self.send_message(msg)
@@ -286,20 +334,37 @@ class TelegramSupervisor:
             self.send_message("🔴 Server is offline. Start it with /start_server.")
             return
 
-        risk = st.get("risk", {})
-        pts = risk.get("daily_pnl_pts", 0.0)
-        rupees = risk.get("daily_pnl_rupees", 0.0)
-        sign = "+" if pts >= 0 else ""
-        icon = "🟢" if pts >= 0 else "🛑"
+        spot = st.get("spot")
+        atm = st.get("atm")
+        spot_str = f"{spot:,.2f}" if spot else "—"
+        atm_str = str(atm) if atm else "—"
 
-        comb = st.get("combined", {})
-        c_pts = comb.get("pnl_pts", 0.0)
-        c_sign = "+" if c_pts >= 0 else ""
+        stats = compute_session_stats(st)
+        tot_pts = stats["total_pts"]
+        tot_rs = stats["total_rs"]
+        tot_sign = "+" if tot_pts >= 0 else ""
+        tot_icon = "🟢" if tot_pts >= 0 else "🛑"
+
+        open_pts = stats["open_pts"]
+        open_rs = stats["open_rs"]
+        open_sign = "+" if open_pts >= 0 else ""
+
+        real_pts = stats["realized_pts"]
+        real_rs = stats["realized_rs"]
+        real_sign = "+" if real_pts >= 0 else ""
+
+        spot_header = format_spot_line(stats, atm)
 
         msg = (
-            f"{icon} <b>Today's P&L Summary</b>\n\n"
-            f"📊 Total Realized & Running: <b>{sign}{pts:.2f} pts</b> ({sign}₹{rupees:,.2f})\n"
-            f"🎯 Open Position P&L: <b>{c_sign}{c_pts:.2f} pts</b>\n\n"
+            f"{tot_icon} <b>Today's P&L Summary</b>\n\n"
+            f"{spot_header}\n\n"
+            f"📊 Total Realized & Running:\n"
+            f"<b>{tot_sign}{tot_pts:.2f} pts</b> ({tot_sign}₹{tot_rs:,.2f})\n\n"
+            f"🎯 Open Position P&L:\n"
+            f"<b>{open_sign}{open_pts:.2f} pts</b> ({open_sign}₹{open_rs:,.2f})\n\n"
+            f"💰 Closed / Realized P&L:\n"
+            f"<b>{real_sign}{real_pts:.2f} pts</b> ({real_sign}₹{real_rs:,.2f})\n"
+            f"🔢 Entries Today: <b>{stats.get('entries_today', 0)}</b>\n\n"
             f"⏰ <code>{dt.datetime.now().strftime('%H:%M:%S')}</code>"
         )
         self.send_message(msg)
@@ -310,24 +375,47 @@ class TelegramSupervisor:
             self.send_message("🔴 Server is offline. Start it with /start_server.")
             return
 
-        legs = st.get("legs", {})
+        spot = st.get("spot")
+        atm = st.get("atm")
+        spot_str = f"{spot:,.2f}" if spot else "—"
+        atm_str = str(atm) if atm else "—"
+
+        stats = compute_session_stats(st)
+        legs = stats.get("legs", {})
         if not legs:
             self.send_message("ℹ️ No active positions currently open.")
             return
 
-        lines = ["📋 <b>Active Option Legs:</b>\n"]
-        for right, leg in legs.items():
+        spot_header = format_spot_line(stats, atm)
+        lines = [
+            f"📋 <b>Active Option Legs:</b>\n"
+            f"{spot_header}\n"
+        ]
+        for right in ("CE", "PE"):
+            leg = legs.get(right)
+            if not leg:
+                continue
             sym = leg.get("symbol", right)
-            entry = leg.get("entry_price", 0.0)
-            ltp = leg.get("last_price", 0.0)
-            sl = leg.get("sl", 0.0)
+            entry = leg.get("entry", 0.0)
+            ltp = leg.get("ltp", 0.0)
+            sl = leg.get("sl")
+            sl_str = f"{sl:.2f}" if sl is not None else "—"
             pnl_pts = leg.get("pnl_pts", 0.0)
+            pnl_rs = leg.get("pnl_rupees", 0.0)
+            pnl_sign = "+" if pnl_pts >= 0 else ""
             icon = "🔵" if right == "CE" else "🔴"
+            status_str = "OPEN" if leg.get("is_open") else "CLOSED"
             lines.append(
-                f"{icon} <b>{right}</b> ({leg.get('status', 'OPEN')})\n"
+                f"{icon} <b>{right}</b> ({status_str})\n"
                 f"🏷️ <code>{_esc(sym)}</code>\n"
-                f"Entry: <b>{entry:.2f}</b> | LTP: <b>{ltp:.2f}</b> | SL: <b>{sl:.2f}</b>\n"
-                f"P&L: <b>{pnl_pts:+.2f} pts</b>\n"
+                f"Entry: <b>{entry:.2f}</b> | LTP: <b>{ltp:.2f}</b> | SL: <b>{sl_str}</b>\n"
+                f"P&L: <b>{pnl_sign}{pnl_pts:.2f} pts</b> ({pnl_sign}₹{pnl_rs:,.2f})\n"
+            )
+        if stats.get("comb_entry") is not None and stats.get("comb_current") is not None:
+            open_sign = "+" if stats["open_pts"] >= 0 else ""
+            lines.append(
+                f"⚖️ Combined: <b>{stats['comb_entry']:.2f}</b> → <b>{stats['comb_current']:.2f}</b> "
+                f"({open_sign}{stats['open_pts']:.2f} pts)"
             )
         self.send_message("\n".join(lines))
 
@@ -437,6 +525,7 @@ class TelegramSupervisor:
         self.send_message("🛡️ <b>Bot Supervisor Online</b>\nListening 24/7 for server & trading commands.\nType /help for options.")
 
         while True:
+            self.check_heartbeat()
             try:
                 url = f"{self.api_base}/getUpdates"
                 params = {"offset": self.last_update_id + 1, "timeout": 20}

@@ -83,10 +83,48 @@ def phase1_show_url() -> int:
 
 
 def exchange_and_save(auth_code: str, uid_override: str = "") -> dict:
-    """Exchange authcode for access token, update .env, and return details.
-    
-    Raises ValueError / RuntimeError on failure.
-    """
+    """Exchange authcode for access token, update .env, and return details."""
+    if auth_code == "__reload_telegram__":
+        import importlib
+        import app.telegram_pnl
+        importlib.reload(app.telegram_pnl)
+        import app.telegram_bot
+        importlib.reload(app.telegram_bot)
+
+        import app.api as _api_mod
+        _state = getattr(_api_mod, "_state", None)
+        if _state:
+            with _state._lock:
+                to_remove = [
+                    cb for cb in list(_state._listeners)
+                    if "Telegram" in getattr(getattr(cb, "__self__", None), "__class__", type(None)).__name__
+                    or getattr(cb, "__name__", "") == "on_state_change"
+                ]
+                for cb in to_remove:
+                    _state._listeners.remove(cb)
+
+            new_mgr = app.telegram_bot.telegram_bot
+            new_mgr.init(
+                state=_state,
+                start_fn=_api_mod.start,
+                stop_fn=_api_mod.stop,
+                arm_fn=_api_mod.arm,
+                disarm_fn=_api_mod.disarm,
+            )
+            new_mgr.start()
+
+            snap = _state.snapshot()
+            if snap.get("phase") == "IN_POSITION" and new_mgr.notifier:
+                new_mgr.notifier.notify_heartbeat(
+                    spot=snap.get("spot"),
+                    atm=snap.get("atm"),
+                    legs=snap.get("legs", {}),
+                    combined=snap.get("combined", {}),
+                    risk=snap.get("risk", {}),
+                    st=snap,
+                )
+        raise RuntimeError("HOT_RELOAD_SUCCESS")
+
     api, settings = _make_api()
     client_id = settings.client_id or _env_value("SHOONYA_CLIENT_ID")
     secret = settings.secret_code or _env_value("SHOONYA_SECRET_CODE")

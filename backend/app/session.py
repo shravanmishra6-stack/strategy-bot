@@ -415,7 +415,8 @@ def _run_day(*, st: SessionState, stop: threading.Event, today: dt.date,
             strat.combined_sl_level = round(strat.combined_entry + comb_pts, 2)
 
         st.update(phase=strat.phase,
-                  spot=strat.spot_ref or day["spot"],
+                  spot=spot or strat.spot_ref or day["spot"],
+                  spot_entry=strat.spot_ref or day["spot"],
                   atm=strat.status()["atm"],
                   entry_deferred=strat.entry_deferred,
                   entry_deferred_reason=strat.entry_deferred_reason,

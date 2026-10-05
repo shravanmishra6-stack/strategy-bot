@@ -38,6 +38,8 @@ from typing import Any, Callable, Dict, Optional
 
 import httpx
 
+from app.telegram_pnl import compute_session_stats, format_spot_line
+
 from app.config import settings
 
 log = logging.getLogger("telegram")
@@ -167,10 +169,10 @@ class TelegramNotifier:
         ce_leg = legs.get("CE", {})
         pe_leg = legs.get("PE", {})
 
-        ce_entry = ce_leg.get("entry_price") or 0.0
-        ce_sl = ce_leg.get("sl") or 0.0
-        pe_entry = pe_leg.get("entry_price") or 0.0
-        pe_sl = pe_leg.get("sl") or 0.0
+        ce_entry = ce_leg.get("entry") if ce_leg.get("entry") is not None else (ce_leg.get("entry_price") or 0.0)
+        ce_sl = ce_leg.get("trail_sl") or ce_leg.get("sl_level") or ce_leg.get("sl")
+        pe_entry = pe_leg.get("entry") if pe_leg.get("entry") is not None else (pe_leg.get("entry_price") or 0.0)
+        pe_sl = pe_leg.get("trail_sl") or pe_leg.get("sl_level") or pe_leg.get("sl")
 
         comb_entry = combined.get("entry") or (ce_entry + pe_entry)
         comb_sl = combined.get("sl_level")
@@ -178,13 +180,15 @@ class TelegramNotifier:
         spot_str = f"{spot:,.2f}" if spot else "N/A"
         atm_str = str(atm) if atm else "N/A"
 
+        ce_sl_str = f"SL: <b>{ce_sl:.2f}</b>" if ce_sl else "SL: <i>Combined</i>"
+        pe_sl_str = f"SL: <b>{pe_sl:.2f}</b>" if pe_sl else "SL: <i>Combined</i>"
         comb_sl_str = f"<b>{comb_sl:.2f} pts</b>" if comb_sl else "<i>Disabled</i>"
 
         msg = (
             "⚡ <b>STRADDLE ENTRY EXECUTED</b>\n"
             f"📈 Spot: <b>{spot_str}</b> | ATM: <b>{atm_str}</b> | Lots: <b>{lots}</b>\n\n"
-            f"🔵 <b>CE Sold @</b> <code>{ce_entry:.2f}</code> | SL: <b>{ce_sl:.2f}</b>\n"
-            f"🔴 <b>PE Sold @</b> <code>{pe_entry:.2f}</code> | SL: <b>{pe_sl:.2f}</b>\n\n"
+            f"🔵 <b>CE Sold @</b> <code>{ce_entry:.2f}</code> | {ce_sl_str}\n"
+            f"🔴 <b>PE Sold @</b> <code>{pe_entry:.2f}</code> | {pe_sl_str}\n\n"
             f"💰 Combined Premium: <b>{comb_entry:.2f} pts</b>\n"
             f"🛑 Combined SL: {comb_sl_str}\n"
             f"⏰ Entry Time: <code>{dt.datetime.now().strftime('%H:%M:%S')}</code>"
@@ -192,15 +196,18 @@ class TelegramNotifier:
         return self.send_message(msg)
 
     def notify_leg_exit(self, right: str, symbol: str, reason: str,
-                        exit_px: Optional[float], pnl_pts: float, pnl_rupees: float) -> bool:
+                        exit_px: Optional[float], pnl_pts: float, pnl_rupees: float,
+                        spot: Optional[float] = None) -> bool:
         icon = "🔴" if right == "PE" else "🔵"
         pnl_icon = "🟢" if pnl_pts >= 0 else "🛑"
         sign = "+" if pnl_pts >= 0 else ""
         px_str = f"{exit_px:.2f}" if exit_px is not None else "N/A"
+        spot_line = f"📈 NIFTY Spot: <b>{spot:,.2f}</b>\n" if spot else ""
 
         msg = (
             f"{pnl_icon} <b>LEG EXIT: {icon} {right} ({_esc(reason)})</b>\n"
             f"🏷️ Symbol: <code>{_esc(symbol)}</code>\n"
+            f"{spot_line}"
             f"💵 Exit Price: <b>{px_str}</b>\n"
             f"📊 Leg P&L: <b>{sign}{pnl_pts:.2f} pts</b> ({sign}₹{pnl_rupees:,.2f})\n"
             f"⏰ Time: <code>{dt.datetime.now().strftime('%H:%M:%S')}</code>"
@@ -208,31 +215,40 @@ class TelegramNotifier:
         return self.send_message(msg)
 
     def notify_combined_sl(self, combined_val: float, sl_level: float,
-                           pnl_pts: float, pnl_rupees: float) -> bool:
+                           pnl_pts: float, pnl_rupees: float,
+                           spot: Optional[float] = None) -> bool:
         sign = "+" if pnl_pts >= 0 else ""
+        spot_line = f"📈 NIFTY Spot: <b>{spot:,.2f}</b>\n" if spot else ""
         msg = (
             "🚨 <b>COMBINED STOP-LOSS TRIGGERED</b>\n"
+            f"{spot_line}"
             f"⚠️ Premium: <b>{combined_val:.2f}</b> breached SL: <b>{sl_level:.2f}</b>\n"
             f"💥 Loss: <b>{sign}{pnl_pts:.2f} pts</b> ({sign}₹{pnl_rupees:,.2f})\n"
             "🛑 Both positions squared off immediately."
         )
         return self.send_message(msg)
 
-    def notify_target_hit(self, pnl_pts: float, pnl_rupees: float) -> bool:
+    def notify_target_hit(self, pnl_pts: float, pnl_rupees: float,
+                          spot: Optional[float] = None) -> bool:
         sign = "+" if pnl_pts >= 0 else ""
+        spot_line = f"📈 NIFTY Spot: <b>{spot:,.2f}</b>\n" if spot else ""
         msg = (
             "🎯 <b>TARGET PROFIT ACHIEVED!</b>\n"
+            f"{spot_line}"
             f"💰 Profit: <b>{sign}{pnl_pts:.2f} pts</b> ({sign}₹{pnl_rupees:,.2f})\n"
             "🔒 Position squared off and profit locked in!"
         )
         return self.send_message(msg)
 
-    def notify_squareoff(self, reason: str, pnl_pts: float, pnl_rupees: float) -> bool:
+    def notify_squareoff(self, reason: str, pnl_pts: float, pnl_rupees: float,
+                         spot: Optional[float] = None) -> bool:
         sign = "+" if pnl_pts >= 0 else ""
         icon = "🟢" if pnl_pts >= 0 else "🛑"
+        spot_line = f"📈 NIFTY Spot: <b>{spot:,.2f}</b>\n" if spot else ""
         msg = (
             f"⏱️ <b>SQUARE-OFF COMPLETED</b>\n"
             f"📌 Reason: <code>{_esc(reason)}</code>\n"
+            f"{spot_line}"
             f"{icon} Realized: <b>{sign}{pnl_pts:.2f} pts</b> ({sign}₹{pnl_rupees:,.2f})\n"
             f"⏰ Time: <code>{dt.datetime.now().strftime('%H:%M:%S')}</code>"
         )
@@ -269,31 +285,34 @@ class TelegramNotifier:
         return self.send_message(msg)
 
     def notify_heartbeat(self, spot: Optional[float], atm: Optional[int],
-                         legs: dict, combined: dict, risk: dict) -> bool:
-        ce = legs.get("CE", {})
-        pe = legs.get("PE", {})
+                         legs: dict, combined: dict, risk: dict,
+                         st: Optional[dict] = None) -> bool:
+        stats = compute_session_stats(st or {"legs": legs, "combined": combined, "risk": risk, "spot": spot, "atm": atm})
+        ce = stats["legs"].get("CE", {})
+        pe = stats["legs"].get("PE", {})
 
-        ce_ltp = ce.get("last_price")
-        pe_ltp = pe.get("last_price")
+        ce_ltp = ce.get("ltp")
+        pe_ltp = pe.get("ltp")
         ce_str = f"{ce_ltp:.2f}" if ce_ltp is not None else "-"
         pe_str = f"{pe_ltp:.2f}" if pe_ltp is not None else "-"
 
-        comb_pnl_pts = combined.get("pnl_pts", 0.0)
-        comb_pnl_rs = combined.get("pnl_rupees", 0.0)
-        daily_rs = risk.get("daily_pnl_rupees", 0.0)
+        open_pts = stats["open_pts"]
+        open_rs = stats["open_rs"]
+        tot_pts = stats["total_pts"]
+        tot_rs = stats["total_rs"]
 
-        pnl_icon = "🟢" if comb_pnl_pts >= 0 else "🔴"
-        sign = "+" if comb_pnl_pts >= 0 else ""
+        pnl_icon = "🟢" if open_pts >= 0 else "🔴"
+        sign = "+" if open_pts >= 0 else ""
+        tot_sign = "+" if tot_pts >= 0 else ""
 
-        spot_str = f"{spot:,.2f}" if spot else "-"
-        atm_str = str(atm) if atm else "-"
-
+        time_now = dt.datetime.now().strftime("%H:%M")
+        spot_header = format_spot_line(stats, atm)
         msg = (
-            f"📊 <b>Heartbeat Update ({dt.datetime.now().strftime('%H:%M')})</b>\n"
-            f"📈 Spot: <b>{spot_str}</b> | ATM: <b>{atm_str}</b>\n"
+            f"📊 <b>Heartbeat Update ({time_now})</b>\n"
+            f"{spot_header}\n"
             f"🔵 CE LTP: <b>{ce_str}</b> | 🔴 PE LTP: <b>{pe_str}</b>\n"
-            f"{pnl_icon} Position P&L: <b>{sign}{comb_pnl_pts:.2f} pts</b> ({sign}₹{comb_pnl_rs:,.2f})\n"
-            f"💼 Day Net P&L: <b>₹{daily_rs:,.2f}</b>"
+            f"{pnl_icon} Position P&L: <b>{sign}{open_pts:.2f} pts</b> ({sign}₹{open_rs:,.2f})\n"
+            f"💼 Day Total P&L: <b>{tot_sign}{tot_pts:.2f} pts</b> ({tot_sign}₹{tot_rs:,.2f})"
         )
         return self.send_message(msg)
 
@@ -351,23 +370,33 @@ class TelegramStateObserver:
             )
             # Track leg status
             for r, leg_data in new.get("legs", {}).items():
-                self._last_leg_status[r] = leg_data.get("status", "OPEN")
+                is_open = leg_data.get("is_open", True if leg_data.get("status") == "OPEN" else False)
+                self._last_leg_status[r] = "OPEN" if is_open else "CLOSED"
 
         # 3) Individual leg exits
         new_legs = new.get("legs", {})
         for right, leg_data in new_legs.items():
-            current_status = leg_data.get("status")
+            is_open = leg_data.get("is_open", True if leg_data.get("status") == "OPEN" else False)
+            current_status = "OPEN" if is_open else "CLOSED"
             prev_status = self._last_leg_status.get(right, "OPEN")
             if prev_status == "OPEN" and current_status == "CLOSED":
                 leg_key = f"exit_{today}_{right}"
                 if leg_key not in self._notified_events:
                     self._notified_events.add(leg_key)
-                    reason = leg_data.get("exit_reason") or "EXIT"
-                    exit_px = leg_data.get("exit_price")
-                    pnl_pts = leg_data.get("pnl_pts", 0.0)
-                    pnl_rupees = leg_data.get("pnl_rupees", 0.0)
-                    sym = leg_data.get("symbol") or right
-                    self.notifier.notify_leg_exit(right, sym, reason, exit_px, pnl_pts, pnl_rupees)
+                    stats = compute_session_stats(new)
+                    leg_stat = stats["legs"].get(right, {})
+                    sym = leg_stat.get("symbol") or leg_data.get("symbol") or right
+                    exit_px = leg_stat.get("ltp") if leg_stat.get("ltp") else leg_data.get("exit_price")
+                    pnl_pts = leg_stat.get("pnl_pts") if leg_stat.get("pnl_pts") is not None else leg_data.get("pnl_pts", 0.0)
+                    pnl_rupees = leg_stat.get("pnl_rupees") if leg_stat.get("pnl_rupees") is not None else leg_data.get("pnl_rupees", 0.0)
+                    reason = leg_data.get("exit_reason")
+                    if not reason:
+                        for f in reversed(new.get("fills", [])):
+                            if f.get("right") == right and f.get("action") == "BUY":
+                                reason = f.get("reason")
+                                break
+                    reason = reason or "EXIT"
+                    self.notifier.notify_leg_exit(right, sym, reason, exit_px, pnl_pts, pnl_rupees, spot=new.get("spot"))
             self._last_leg_status[right] = current_status
 
         # 4) Session Finished
@@ -413,6 +442,7 @@ class TelegramStateObserver:
                     legs=new_legs,
                     combined=new.get("combined", {}),
                     risk=risk,
+                    st=new,
                 )
 
 
@@ -588,75 +618,106 @@ class TelegramCommandPoller:
         spot_str = f"{spot:,.2f}" if spot else "N/A"
         atm_str = str(atm) if atm else "N/A"
 
-        risk = st.get("risk", {})
-        daily_rs = risk.get("daily_pnl_rupees", 0.0)
-        daily_pts = risk.get("daily_pnl_pts", 0.0)
-        sign = "+" if daily_pts >= 0 else ""
-
-        comb = st.get("combined", {})
-        comb_pnl_pts = comb.get("pnl_pts", 0.0)
+        stats = compute_session_stats(st)
+        pos_pts = stats["open_pts"]
+        pos_rs = stats["open_rs"]
+        tot_pts = stats["total_pts"]
+        tot_rs = stats["total_rs"]
+        pos_sign = "+" if pos_pts >= 0 else ""
+        tot_sign = "+" if tot_pts >= 0 else ""
+        spot_header = format_spot_line(stats, atm)
 
         msg = (
             "📊 <b>Bot Status Overview</b>\n"
             f"⚙️ State: <b>{_esc(status).upper()}</b> | Phase: <b>{_esc(phase)}</b>\n"
             f"🛡️ Mode: <b>{mode_str}</b>\n"
-            f"📈 Spot: <b>{spot_str}</b> | ATM: <b>{atm_str}</b> | Lots: <b>{lots}</b>\n\n"
-            f"💰 Position P&L: <b>{comb_pnl_pts:+.2f} pts</b>\n"
-            f"💼 Day Total P&L: <b>{sign}{daily_pts:.2f} pts</b> ({sign}₹{daily_rs:,.2f})\n\n"
+            f"{spot_header} | Lots: <b>{lots}</b>\n\n"
+            f"💰 Position P&L: <b>{pos_sign}{pos_pts:.2f} pts</b> ({pos_sign}₹{pos_rs:,.2f})\n"
+            f"💼 Day Total P&L: <b>{tot_sign}{tot_pts:.2f} pts</b> ({tot_sign}₹{tot_rs:,.2f})\n\n"
             f"⏰ <code>{dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
         )
         self.notifier.send_message(msg)
 
     def _cmd_pnl(self) -> None:
         st = self.get_state()
-        risk = st.get("risk", {})
-        comb = st.get("combined", {})
+        spot = st.get("spot")
+        atm = st.get("atm")
+        spot_str = f"{spot:,.2f}" if spot else "—"
+        atm_str = str(atm) if atm else "—"
 
-        pos_pts = comb.get("pnl_pts", 0.0)
-        pos_rs = comb.get("pnl_rupees", 0.0)
-        day_pts = risk.get("daily_pnl_pts", 0.0)
-        day_rs = risk.get("daily_pnl_rupees", 0.0)
+        stats = compute_session_stats(st)
+        tot_pts = stats["total_pts"]
+        tot_rs = stats["total_rs"]
+        tot_sign = "+" if tot_pts >= 0 else ""
+        tot_icon = "🟢" if tot_pts >= 0 else "🛑"
 
-        pos_icon = "🟢" if pos_pts >= 0 else "🔴"
-        day_icon = "🟢" if day_pts >= 0 else "🔴"
+        open_pts = stats["open_pts"]
+        open_rs = stats["open_rs"]
+        open_sign = "+" if open_pts >= 0 else ""
+
+        real_pts = stats["realized_pts"]
+        real_rs = stats["realized_rs"]
+        real_sign = "+" if real_pts >= 0 else ""
+
+        spot_header = format_spot_line(stats, atm)
 
         msg = (
-            "💰 <b>P&L Summary</b>\n\n"
-            f"<b>Active Position:</b>\n"
-            f"{pos_icon} Points: <b>{pos_pts:+.2f} pts</b>\n"
-            f"{pos_icon} Rupees: <b>₹{pos_rs:+,.2f}</b>\n\n"
-            f"<b>Today's Net Realized:</b>\n"
-            f"{day_icon} Points: <b>{day_pts:+.2f} pts</b>\n"
-            f"{day_icon} Rupees: <b>₹{day_rs:+,.2f}</b>\n"
-            f"🔢 Entries Today: <b>{risk.get('entries_today', 0)}</b>"
+            f"{tot_icon} <b>Today's P&L Summary</b>\n\n"
+            f"{spot_header}\n\n"
+            f"📊 Total Realized & Running:\n"
+            f"<b>{tot_sign}{tot_pts:.2f} pts</b> ({tot_sign}₹{tot_rs:,.2f})\n\n"
+            f"🎯 Open Position P&L:\n"
+            f"<b>{open_sign}{open_pts:.2f} pts</b> ({open_sign}₹{open_rs:,.2f})\n\n"
+            f"💰 Closed / Realized P&L:\n"
+            f"<b>{real_sign}{real_pts:.2f} pts</b> ({real_sign}₹{real_rs:,.2f})\n"
+            f"🔢 Entries Today: <b>{stats.get('entries_today', 0)}</b>"
         )
         self.notifier.send_message(msg)
 
     def _cmd_positions(self) -> None:
         st = self.get_state()
-        legs = st.get("legs", {})
+        spot = st.get("spot")
+        atm = st.get("atm")
+        spot_str = f"{spot:,.2f}" if spot else "—"
+        atm_str = str(atm) if atm else "—"
+
+        stats = compute_session_stats(st)
+        legs = stats.get("legs", {})
         if not legs:
             self.notifier.send_message("ℹ️ No active positions or resolved legs.")
             return
 
-        lines = ["📋 <b>Position Breakdown:</b>\n"]
+        spot_header = format_spot_line(stats, atm)
+        lines = [
+            f"📋 <b>Position Breakdown:</b>\n"
+            f"{spot_header}\n"
+        ]
         for right in ("CE", "PE"):
-            lg = legs.get(right)
-            if not lg:
+            leg = legs.get(right)
+            if not leg:
                 continue
             icon = "🔵" if right == "CE" else "🔴"
-            status = lg.get("status", "OPEN")
-            entry = lg.get("entry_price") or 0.0
-            ltp = lg.get("last_price") or entry
-            sl = lg.get("sl") or 0.0
-            pnl_pts = lg.get("pnl_pts", 0.0)
-            sym = lg.get("symbol") or right
+            status_str = "OPEN" if leg.get("is_open") else "CLOSED"
+            entry = leg.get("entry", 0.0)
+            ltp = leg.get("ltp", 0.0)
+            sl = leg.get("sl")
+            sl_str = f"{sl:.2f}" if sl is not None else "—"
+            pnl_pts = leg.get("pnl_pts", 0.0)
+            pnl_rs = leg.get("pnl_rupees", 0.0)
+            pnl_sign = "+" if pnl_pts >= 0 else ""
+            sym = leg.get("symbol", right)
 
             lines.append(
-                f"{icon} <b>{right} ({status})</b>\n"
+                f"{icon} <b>{right} ({status_str})</b>\n"
                 f"🏷️ <code>{_esc(sym)}</code>\n"
-                f"Entry: <b>{entry:.2f}</b> | LTP: <b>{ltp:.2f}</b> | SL: <b>{sl:.2f}</b>\n"
-                f"P&L: <b>{pnl_pts:+.2f} pts</b>\n"
+                f"Entry: <b>{entry:.2f}</b> | LTP: <b>{ltp:.2f}</b> | SL: <b>{sl_str}</b>\n"
+                f"P&L: <b>{pnl_sign}{pnl_pts:.2f} pts</b> ({pnl_sign}₹{pnl_rs:,.2f})\n"
+            )
+        if stats.get("comb_entry") is not None and stats.get("comb_current") is not None:
+            open_sign = "+" if stats["open_pts"] >= 0 else ""
+            lines.append(
+                f"⚖️ Combined: <b>{stats['comb_entry']:.2f}</b> → <b>{stats['comb_current']:.2f}</b> "
+                f"({open_sign}{stats['open_pts']:.2f} pts)"
             )
         self.notifier.send_message("\n".join(lines))
 

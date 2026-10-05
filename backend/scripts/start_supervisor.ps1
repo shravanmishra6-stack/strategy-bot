@@ -17,11 +17,11 @@ $stdout = Join-Path $log "supervisor.log"
 $stderr = Join-Path $log "supervisor.err"
 
 # Check if supervisor is already running
-$existing = Get-Process python -ErrorAction SilentlyContinue | Where-Object {
+$existing = Get-CimInstance Win32_Process -Filter "Name LIKE 'python%'" -ErrorAction SilentlyContinue | Where-Object {
     $_.CommandLine -like "*bot_supervisor*"
 }
 if ($existing) {
-    Write-Host "Telegram Supervisor is already running (PID: $($existing.Id))"
+    Write-Host "Telegram Supervisor is already running (PID: $($existing.ProcessId))"
     exit 0
 }
 
