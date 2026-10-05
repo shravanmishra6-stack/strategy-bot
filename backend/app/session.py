@@ -119,7 +119,15 @@ class SessionState:
 
 def _quote_price(res: InstrumentResolver, exchange: str, token: str):
     """Last traded price for one instrument via the verified quotes endpoint."""
-    q = res.client.get_quotes(exchange, token) or {}
+    try:
+        q = res.client.get_quotes(exchange, token) or {}
+    except BrokerError as e:
+        log.debug("get_quotes transient failure for %s %s: %s", exchange, token, e)
+        return None
+    except Exception as e:
+        log.warning("get_quotes error for %s %s: %s", exchange, token, e)
+        return None
+
     if not isinstance(q, dict):
         return None
     # Crucial safety check: ensure the response matches the requested token and exchange.
@@ -348,8 +356,39 @@ def _run_day(*, st: SessionState, stop: threading.Event, today: dt.date,
     # on a server that was never restarted.
     risk.on_new_day(today)
     engine = ExecutionEngine(client, paper_mode=settings.paper_mode)
+
+    def _re_resolve_legs(new_atm: int):
+        nonlocal legs, resolved
+        new_legs = res.resolve(
+            expiry=day["expiry"],
+            atm=new_atm,
+            step=res.strike_step,
+            pe_offset_steps=params.strike_offset,
+        )
+        legs = new_legs
+        resolved = {
+            "expiry": str(day["expiry"]),
+            "atm": new_atm,
+            "spot": day.get("spot"),
+            "lot_size": day["lot_size"],
+            "legs": [{"right": l.right, "symbol": l.tradingsymbol,
+                      "token": l.token, "strike": l.strike,
+                      "exchange": l.exchange, "lot_size": l.lot_size,
+                      "order_qty": _lots * (l.lot_size or 0)} for l in legs],
+        }
+        st.update(resolved=resolved, atm=new_atm)
+        journal.attach_day(engine=engine, lot_size=day["lot_size"], lots=_lots,
+                           params={**params.to_dict(),
+                                   "ce_symbol": next((l.tradingsymbol for l in legs
+                                                      if l.right == "CE"), None),
+                                   "pe_symbol": next((l.tradingsymbol for l in legs
+                                                      if l.right == "PE"), None)})
+        return [(SoldLeg(right=inst.right, strike=inst.strike, token=inst.token,
+                         sl_pct=params.sl_pct, target_pct=params.target_pct,
+                         trail_pct=params.trail_pct), inst) for inst in legs]
+
     strat = LiveStraddle(params=params, exec_engine=engine, risk=risk,
-                         date=today, lots=_lots)
+                         date=today, lots=_lots, re_resolve_fn=_re_resolve_legs)
     pairs = [(SoldLeg(right=inst.right, strike=inst.strike, token=inst.token,
                       sl_pct=params.sl_pct, target_pct=params.target_pct,
                       trail_pct=params.trail_pct), inst) for inst in legs]
@@ -396,6 +435,8 @@ def _run_day(*, st: SessionState, stop: threading.Event, today: dt.date,
             spot = _quote_price(res, res.index_exchange, res.index_token)
             if spot:
                 strat.on_tick(now, res.index_token, spot)
+            # Clear transient error if poll succeeded
+            st.update(error=None)
         except SessionExpiredError as e:
             st.update(status="session_expired", error=str(e),
                       phase=strat.phase)

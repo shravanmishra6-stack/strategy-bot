@@ -335,6 +335,7 @@ class TelegramStateObserver:
         self.last_heartbeat = time.time()
         self._notified_events: set = set()
         self._last_leg_status: Dict[str, str] = {}
+        self._entered_legs: set = set()
 
     def on_state_update(self, old: dict, new: dict, changes: dict) -> None:
         """Invoked by SessionState whenever st.update(...) is called."""
@@ -372,14 +373,20 @@ class TelegramStateObserver:
             for r, leg_data in new.get("legs", {}).items():
                 is_open = leg_data.get("is_open", True if leg_data.get("status") == "OPEN" else False)
                 self._last_leg_status[r] = "OPEN" if is_open else "CLOSED"
+                if is_open or leg_data.get("entry") is not None or leg_data.get("entry_price") is not None:
+                    self._entered_legs.add(r)
 
         # 3) Individual leg exits
         new_legs = new.get("legs", {})
         for right, leg_data in new_legs.items():
             is_open = leg_data.get("is_open", True if leg_data.get("status") == "OPEN" else False)
             current_status = "OPEN" if is_open else "CLOSED"
-            prev_status = self._last_leg_status.get(right, "OPEN")
-            if prev_status == "OPEN" and current_status == "CLOSED":
+            prev_status = self._last_leg_status.get(right, "CLOSED")
+            if is_open or leg_data.get("entry") is not None or leg_data.get("entry_price") is not None:
+                self._entered_legs.add(right)
+            # Only report a leg exit if it was genuinely open before AND actually entered (not pre-entry default)
+            had_entry = right in self._entered_legs or leg_data.get("entry") is not None or leg_data.get("entry_price") is not None
+            if prev_status == "OPEN" and current_status == "CLOSED" and had_entry:
                 leg_key = f"exit_{today}_{right}"
                 if leg_key not in self._notified_events:
                     self._notified_events.add(leg_key)

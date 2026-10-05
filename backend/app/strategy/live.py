@@ -54,6 +54,7 @@ class LiveStraddle:
     date: dt.date = None
     now: dt.datetime | None = None
 
+    re_resolve_fn: object = None        # Optional Callable[[int], list[tuple[SoldLeg, LegInstrument]]]
     phase: str = "WAIT_ENTRY"           # WAIT_ENTRY -> IN_POSITION -> DONE
     spot_ref: float | None = None
     legs: dict = field(default_factory=dict)         # right -> SoldLeg
@@ -158,10 +159,27 @@ class LiveStraddle:
         want_pe = atm + self.params.strike_offset * self.params.strike_step
         ce, pe = self.instruments.get("CE"), self.instruments.get("PE")
         if not ce or not pe or ce.strike != atm or pe.strike != want_pe:
-            self.errors.append(f"strikes not resolvable at ATM {atm}")
-            log.error("%s", self.errors[-1])
-            self.phase = "DONE"
-            return
+            re_resolved = False
+            if callable(self.re_resolve_fn):
+                try:
+                    log.info("ATM shifted to %s (current CE %s, PE %s); re-resolving contracts dynamically...",
+                             atm, getattr(ce, "strike", None), getattr(pe, "strike", None))
+                    new_pairs = self.re_resolve_fn(atm)
+                    if new_pairs:
+                        self.configure(spot_token=self._spot_token, legs=new_pairs)
+                        ce, pe = self.instruments.get("CE"), self.instruments.get("PE")
+                        if ce and pe and ce.strike == atm and pe.strike == want_pe:
+                            re_resolved = True
+                            log.info("Successfully re-resolved contracts for ATM %s: CE=%s, PE=%s",
+                                     atm, ce.tradingsymbol, pe.tradingsymbol)
+                except Exception as e:
+                    log.warning("Dynamic re-resolution for ATM %s failed: %s", atm, e)
+
+            if not re_resolved:
+                self.errors.append(f"strikes not resolvable at ATM {atm}")
+                log.error("%s", self.errors[-1])
+                self.phase = "DONE"
+                return
         decision = self.risk.allow_entry(lots=self.lots, now=ts)
         if not decision:
             log.warning("entry blocked by risk: %s", decision.reason)

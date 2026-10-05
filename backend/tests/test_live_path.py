@@ -1106,3 +1106,43 @@ def test_phase2_never_writes_env_on_rejection(monkeypatch):
     assert ol.phase2_exchange("bad-code") == 2
     assert written == {}
 
+
+def test_dynamic_re_resolve_when_atm_shifts_before_entry():
+    """If spot moves across a strike bucket prior to entry, contracts are dynamically re-resolved."""
+    live, eng = make_live()  # Initially configured for strike 25000 (CE=1001, PE=1002)
+
+    # Mock re_resolve callback that returns new instruments for ATM 25050
+    re_resolved_atm = []
+    def fake_re_resolve(new_atm):
+        re_resolved_atm.append(new_atm)
+        ce_new = LegInstrument(token="2001", tradingsymbol=f"NIFTY29SEP26C{new_atm}",
+                               strike=new_atm, right="CE", exchange="NFO", lot_size=LOT)
+        pe_new = LegInstrument(token="2002", tradingsymbol=f"NIFTY29SEP26P{new_atm}",
+                               strike=new_atm, right="PE", exchange="NFO", lot_size=LOT)
+        ce_leg = SoldLeg(right="CE", strike=new_atm, sl_pct=0.50)
+        pe_leg = SoldLeg(right="PE", strike=new_atm, sl_pct=0.50)
+        return [(ce_leg, ce_new), (pe_leg, pe_new)]
+
+    live.re_resolve_fn = fake_re_resolve
+
+    # Pre-warm prices for the newly re-resolved legs when they get quoted
+    # At 09:20 spot arrives at 25060 -> rounds to ATM 25050 (mismatches initial 25000)
+    # The first spot tick triggers dynamic re-resolution
+    live.on_tick(ts(9, 20), "999", 25060.0)
+    assert re_resolved_atm == [25050]
+    assert live.instruments["CE"].strike == 25050
+    assert live.instruments["PE"].strike == 25050
+    assert live.phase == "WAIT_ENTRY"  # waiting for the new legs' quotes, NOT DONE!
+
+    # Now quotes for the new contracts arrive
+    live.on_tick(ts(9, 20, 1), "2001", 110.0)
+    live.on_tick(ts(9, 20, 2), "2002", 115.0)
+
+    # Next tick triggers entry successfully
+    live.on_tick(ts(9, 20, 3), "999", 25060.0)
+    assert live.phase == "IN_POSITION"
+    assert len(eng.fills) == 2
+    assert live.legs["CE"].strike == 25050
+    assert live.legs["PE"].strike == 25050
+
+

@@ -15,9 +15,11 @@ def test_extract_code():
     assert _extract_code("invalid_text_without_code") is None
 
 
-def test_perform_auto_login_missing_credentials():
+def test_perform_auto_login_missing_credentials(monkeypatch):
     old_pwd = settings.shoonya_password
     old_totp = settings.shoonya_totp_key
+    monkeypatch.setenv("SHOONYA_PASSWORD", "")
+    monkeypatch.setenv("SHOONYA_TOTP_KEY", "")
     try:
         object.__setattr__(settings, "shoonya_password", "")
         object.__setattr__(settings, "shoonya_totp_key", "")

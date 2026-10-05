@@ -348,7 +348,12 @@ async function refresh(){
     $('b-disarm').disabled = !s.live_armed;
     $('clock').textContent = new Date().toLocaleString('en-IN');
 
-    $('msg').textContent = s.error ? ('⚠ ' + s.error) : '';
+    // If the session is actively running and positions are healthy, suppress transient single-tick quote warnings
+    if (s.error && s.session_running && s.phase === 'IN_POSITION' && s.error.includes('get_quotes')) {
+      $('msg').textContent = '';
+    } else {
+      $('msg').textContent = s.error ? ('⚠ ' + s.error) : '';
+    }
 
     // --- Strategy Rules card -----------------------------------------------
     const sp = s.strategy_params || {};

@@ -177,6 +177,26 @@ def test_observer_triggers_on_state_changes():
         assert m_end.call_count == 1
 
 
+def test_observer_no_false_leg_exit_on_pre_entry_abort():
+    """When a session finishes or aborts before entry, no spurious leg exit alerts must be emitted."""
+    notif = TelegramNotifier(token="fake", chat_id="fake", enabled=True)
+    obs = TelegramStateObserver(notifier=notif)
+
+    with patch.object(notif, "notify_leg_exit") as m_exit:
+        # Pre-entry state with legs that have is_open=False / status=None and NO entry
+        legs_pre_entry = {
+            "CE": {"is_open": False, "symbol": "NIFTY_CE", "entry": None, "entry_price": None},
+            "PE": {"is_open": False, "symbol": "NIFTY_PE", "entry": None, "entry_price": None},
+        }
+        # Session aborts / finishes before entry
+        obs.on_state_update(
+            old={"status": "running", "phase": "WAIT_ENTRY"},
+            new={"status": "done", "phase": "DONE", "legs": legs_pre_entry, "day": "2026-10-06"},
+            changes={"status": "done", "phase": "DONE"}
+        )
+        assert m_exit.call_count == 0
+
+
 def test_command_poller_authorization_and_dispatch():
     notif = TelegramNotifier(token="fake", chat_id="111222", enabled=True)
     get_state = MagicMock(return_value={
