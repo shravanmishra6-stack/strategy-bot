@@ -373,3 +373,57 @@ def test_compute_session_stats_journal_eod_fallback():
         assert stats_none["total_rs"] == 317.5
         assert stats_none["entries_today"] == 7
 
+
+def test_telegram_commands_show_strategy_orders_pnl():
+    from app.telegram_bot import TelegramNotifier, TelegramCommandPoller
+
+    notif = TelegramNotifier(token="fake", chat_id="111222", enabled=True)
+    poller = TelegramCommandPoller(
+        notifier=notif,
+        get_state_fn=MagicMock(return_value={"status": "done", "day": "2026-10-08"}),
+    )
+
+    mock_stats = {
+        "lot_size": 65, "lots": 1, "qty": 65,
+        "realized_pts": 16.87, "realized_rs": 1096.5,
+        "open_pts": 0.0, "open_rs": 0.0,
+        "total_pts": 16.87, "total_rs": 1096.5,
+        "legs": {}, "entries_today": 1,
+        "orders_strat_pnl": -5411.25,
+        "orders_strat_count": 16,
+    }
+
+    with patch("app.telegram_bot.compute_session_stats", return_value=mock_stats), \
+         patch.object(notif, "send_message") as m_send:
+
+        # Test /status shows strategy orders P&L
+        poller._handle_message({"chat": {"id": 111222}, "text": "/status"})
+        status_txt = m_send.call_args[0][0]
+        assert "Strategy Orders P&L:" in status_txt
+        assert "-5,411.25" in status_txt
+        assert "All Account Orders" not in status_txt
+
+        m_send.reset_mock()
+
+        # Test /pnl shows strategy orders P&L
+        poller._handle_message({"chat": {"id": 111222}, "text": "/pnl"})
+        pnl_txt = m_send.call_args[0][0]
+        assert "Strategy Orders P&L:" in pnl_txt
+        assert "Orders Executed (16):" in pnl_txt
+        assert "-5,411.25" in pnl_txt
+        assert "All Account Orders" not in pnl_txt
+
+        m_send.reset_mock()
+
+        # Test /prev_pnl
+        with patch("app.telegram_bot.get_previous_journal_day", return_value="2026-10-08"), \
+             patch("app.telegram_bot.load_journal_day_stats", return_value=mock_stats):
+            poller._handle_message({"chat": {"id": 111222}, "text": "/prev_pnl"})
+            prev_txt = m_send.call_args[0][0]
+            assert "Previous Day P&L (2026-10-08)" in prev_txt
+            assert "+16.87 pts" in prev_txt
+            assert "+₹1,096.50" in prev_txt
+            assert "Strategy Orders P&L:" in prev_txt
+            assert "-5,411.25" in prev_txt
+
+

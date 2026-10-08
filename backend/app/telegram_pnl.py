@@ -12,9 +12,29 @@ from typing import Any, Dict, Optional
 
 import httpx
 
+import glob
+import os
+from pathlib import Path
+
 from app import journal as journal_mod
 
 _spot_cache = {"price": None, "ts": 0.0}
+
+
+def get_previous_journal_day(ref_date: Optional[str] = None) -> Optional[str]:
+    """Find the most recent trading journal date strictly prior to ref_date."""
+    if not ref_date:
+        ref_date = dt.date.today().isoformat()
+    daily_dir = Path(journal_mod.daily_path(ref_date)).parent
+    if not daily_dir.is_dir():
+        return None
+    matches = []
+    for p in daily_dir.glob("trades_*.xlsx"):
+        name = p.stem.replace("trades_", "")
+        if name < ref_date:
+            matches.append(name)
+    matches.sort()
+    return matches[-1] if matches else None
 
 
 def load_journal_day_stats(day_str: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -101,6 +121,46 @@ def load_journal_day_stats(day_str: Optional[str] = None) -> Optional[Dict[str, 
         lot_size = summary.get("Lot size") or 65
         lots = summary.get("Lots") or 1
 
+        # Calculate P&L strictly for positions/orders placed by our strategy (from Orders tab)
+        # Identifies all symbols touched by the strategy engine (API/tagged), and sums the
+        # completed trades for those symbols (including manual intervention exits for those legs).
+        orders_data = day_data.get("Orders") or []
+        orders_strat_pnl = None
+        orders_strat_count = 0
+        if orders_data:
+            strat_symbols = set()
+            for o in orders_data:
+                if not isinstance(o, dict):
+                    continue
+                if str(o.get("status") or "").upper() != "COMPLETE":
+                    continue
+                if bool(o.get("tag")) or (str(o.get("source") or "").upper() == "API"):
+                    sym = o.get("symbol")
+                    if sym:
+                        strat_symbols.add(sym)
+
+            if strat_symbols:
+                s_buy, s_sell = 0.0, 0.0
+                for o in orders_data:
+                    if not isinstance(o, dict):
+                        continue
+                    if str(o.get("status") or "").upper() != "COMPLETE":
+                        continue
+                    sym = o.get("symbol")
+                    if sym not in strat_symbols:
+                        continue
+                    act = str(o.get("action") or "").upper()
+                    q = _to_float(o.get("fill_qty")) or _to_float(o.get("qty")) or 0.0
+                    px = _to_float(o.get("avg_price")) or _to_float(o.get("price")) or 0.0
+                    val = q * px
+                    orders_strat_count += 1
+                    if act == "BUY":
+                        s_buy += val
+                    elif act == "SELL":
+                        s_sell += val
+                if orders_strat_count > 0:
+                    orders_strat_pnl = round(s_sell - s_buy, 2)
+
         return {
             "day": str(day_str),
             "realized_pts": round(net_pts or 0.0, 2),
@@ -123,6 +183,8 @@ def load_journal_day_stats(day_str: Optional[str] = None) -> Optional[Dict[str, 
             "comb_sl_level": None,
             "source": "journal_daily",
             "session_status": summary.get("Session status") or "done",
+            "orders_strat_pnl": orders_strat_pnl,
+            "orders_strat_count": orders_strat_count,
         }
 
     # 2. Fallback to master sheet
@@ -371,12 +433,18 @@ def compute_session_stats(st: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
     entries_today = risk.get("entries_today", 0)
 
-    # If in-memory state has no fills or no realized P&L recorded, check the trade journal
+    orders_strat_pnl = None
+    orders_strat_count = 0
+
+    # Check journal day stats
     day_str = st.get("day") or dt.date.today().isoformat()
-    if (not fills and realized_pts == 0.0 and realized_rs == 0.0) or st.get("status") in ("done", "stopped", "halted", "idle", "session_expired"):
-        j_stats = load_journal_day_stats(day_str)
-        if j_stats:
-            # If journal has non-zero P&L or recorded trades, use it for realized metrics
+    j_stats = load_journal_day_stats(day_str)
+    if j_stats:
+        orders_strat_pnl = j_stats.get("orders_strat_pnl")
+        orders_strat_count = j_stats.get("orders_strat_count", 0)
+
+        # If in-memory state has no fills or no realized P&L recorded, or session is complete
+        if (not fills and realized_pts == 0.0 and realized_rs == 0.0) or st.get("status") in ("done", "stopped", "halted", "idle", "session_expired"):
             if j_stats.get("realized_pts") or j_stats.get("realized_rs") or j_stats.get("entries_today"):
                 if realized_pts == 0.0 and realized_rs == 0.0:
                     realized_pts = j_stats["realized_pts"]
@@ -412,4 +480,6 @@ def compute_session_stats(st: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "entries_today": entries_today,
         "entry_spot": entry_spot,
         "live_spot": live_spot,
+        "orders_strat_pnl": orders_strat_pnl,
+        "orders_strat_count": orders_strat_count,
     }

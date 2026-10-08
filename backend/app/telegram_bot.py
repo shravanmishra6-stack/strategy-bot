@@ -38,7 +38,12 @@ from typing import Any, Callable, Dict, Optional
 
 import httpx
 
-from app.telegram_pnl import compute_session_stats, format_spot_line
+from app.telegram_pnl import (
+    compute_session_stats,
+    format_spot_line,
+    get_previous_journal_day,
+    load_journal_day_stats,
+)
 
 from app.config import settings
 
@@ -557,8 +562,10 @@ class TelegramCommandPoller:
             self._cmd_help()
         elif cmd == "/status":
             self._cmd_status()
-        elif cmd == "/pnl":
+        elif cmd in ("/pnl", "/today_pnl"):
             self._cmd_pnl()
+        elif cmd in ("/prev_pnl", "/prevpnl", "/yesterday", "/last_pnl"):
+            self._cmd_prev_pnl(text)
         elif cmd == "/positions":
             self._cmd_positions()
         elif cmd == "/start_session":
@@ -594,7 +601,8 @@ class TelegramCommandPoller:
             "🤖 <b>Strategy Bot Control Menu</b>\n\n"
             "<b>📊 Monitoring Commands:</b>\n"
             "• /status - Complete market & bot status overview\n"
-            "• /pnl - Today's Realized & Unrealized P&L\n"
+            "• /pnl - Today's Realized & Running P&L\n"
+            "• /prev_pnl - Previous trading day P&L (or /prev_pnl YYYY-MM-DD)\n"
             "• /positions - Active option legs breakdown\n"
             "• /test - Test bot communication\n\n"
             "<b>⚡ Control Commands:</b>\n"
@@ -636,13 +644,20 @@ class TelegramCommandPoller:
         tot_sign = "+" if tot_pts >= 0 else ""
         spot_header = format_spot_line(stats, atm)
 
+        orders_line = ""
+        ord_strat_pnl = stats.get("orders_strat_pnl")
+        if ord_strat_pnl is not None:
+            s_sign = "+" if ord_strat_pnl >= 0 else ""
+            orders_line = f"\n📑 Strategy Orders P&L: <b>{s_sign}₹{ord_strat_pnl:,.2f}</b>"
+
         msg = (
             "📊 <b>Bot Status Overview</b>\n"
             f"⚙️ State: <b>{_esc(status).upper()}</b> | Phase: <b>{_esc(phase)}</b>\n"
             f"🛡️ Mode: <b>{mode_str}</b> | Broker: <b>{broker_str}</b>\n"
             f"{spot_header} | Lots: <b>{lots}</b>\n\n"
             f"💰 Position P&L: <b>{pos_sign}{pos_pts:.2f} pts</b> ({pos_sign}₹{pos_rs:,.2f})\n"
-            f"💼 Day Total P&L: <b>{tot_sign}{tot_pts:.2f} pts</b> ({tot_sign}₹{tot_rs:,.2f})\n\n"
+            f"💼 Day Total P&L: <b>{tot_sign}{tot_pts:.2f} pts</b> ({tot_sign}₹{tot_rs:,.2f})"
+            f"{orders_line}\n\n"
             f"⏰ <code>{dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
         )
         self.notifier.send_message(msg)
@@ -670,6 +685,17 @@ class TelegramCommandPoller:
 
         spot_header = format_spot_line(stats, atm)
 
+        orders_section = ""
+        ord_strat_pnl = stats.get("orders_strat_pnl")
+        ord_strat_cnt = stats.get("orders_strat_count", 0)
+
+        if ord_strat_pnl is not None:
+            s_sign = "+" if ord_strat_pnl >= 0 else ""
+            orders_section = (
+                f"\n\n📑 <b>Strategy Orders P&L:</b>\n"
+                f"• Orders Executed ({ord_strat_cnt}): <b>{s_sign}₹{ord_strat_pnl:,.2f}</b>"
+            )
+
         msg = (
             f"{tot_icon} <b>Today's P&L Summary</b>\n\n"
             f"{spot_header}\n\n"
@@ -680,6 +706,57 @@ class TelegramCommandPoller:
             f"💰 Closed / Realized P&L:\n"
             f"<b>{real_sign}{real_pts:.2f} pts</b> ({real_sign}₹{real_rs:,.2f})\n"
             f"🔢 Entries Today: <b>{stats.get('entries_today', 0)}</b>"
+            f"{orders_section}\n\n"
+            f"<i>(To view previous session: <code>/prev_pnl</code>)</i>"
+        )
+        self.notifier.send_message(msg)
+
+    def _cmd_prev_pnl(self, text: str = "") -> None:
+        parts = text.strip().split()
+        target_day = None
+        if len(parts) > 1 and parts[1].strip():
+            target_day = parts[1].strip()
+        else:
+            target_day = get_previous_journal_day()
+
+        if not target_day:
+            self.notifier.send_message("ℹ️ No previous journaled trading day found.")
+            return
+
+        stats = load_journal_day_stats(target_day)
+        if not stats:
+            self.notifier.send_message(f"ℹ️ No trading journal data found for date: <code>{_esc(target_day)}</code>")
+            return
+
+        tot_pts = stats.get("total_pts", 0.0)
+        tot_rs = stats.get("total_rs", 0.0)
+        tot_sign = "+" if tot_pts >= 0 else ""
+        tot_icon = "🟢" if tot_pts >= 0 else "🛑"
+
+        real_pts = stats.get("realized_pts", 0.0)
+        real_rs = stats.get("realized_rs", 0.0)
+        real_sign = "+" if real_pts >= 0 else ""
+
+        spot_val = stats.get("entry_spot") or stats.get("live_spot")
+        spot_str = f"{spot_val:,.2f}" if spot_val else "—"
+
+        orders_section = ""
+        ord_strat_pnl = stats.get("orders_strat_pnl")
+        ord_strat_cnt = stats.get("orders_strat_count", 0)
+        if ord_strat_pnl is not None:
+            s_sign = "+" if ord_strat_pnl >= 0 else ""
+            orders_section = (
+                f"\n\n📑 <b>Strategy Orders P&L:</b>\n"
+                f"• Orders Executed ({ord_strat_cnt}): <b>{s_sign}₹{ord_strat_pnl:,.2f}</b>"
+            )
+
+        msg = (
+            f"{tot_icon} <b>Previous Day P&L ({_esc(target_day)})</b>\n\n"
+            f"📈 NIFTY Spot Ref: <code>{spot_str}</code>\n\n"
+            f"📊 Session Net Realized P&L:\n"
+            f"<b>{real_sign}{real_pts:.2f} pts</b> ({real_sign}₹{real_rs:,.2f})\n\n"
+            f"🔢 Entries Recorded: <b>{stats.get('entries_today', 0)}</b>"
+            f"{orders_section}"
         )
         self.notifier.send_message(msg)
 
