@@ -301,9 +301,11 @@ class TelegramSupervisor:
         atm = st.get("atm")
         paper = st.get("paper_mode", True)
         armed = st.get("live_armed", False)
+        session_ok = bool(st.get("session_ok"))
         lots = st.get("lots", 1)
 
         mode_str = "PAPER" if paper else ("LIVE (ARMED)" if armed else "LIVE (DISARMED)")
+        broker_str = "🟢 CONNECTED" if session_ok else "🔴 OFFLINE (/login)"
         spot_str = f"{spot:,.2f}" if spot else "N/A"
         atm_str = str(atm) if atm else "N/A"
 
@@ -320,7 +322,7 @@ class TelegramSupervisor:
             "📊 <b>Bot Status Overview</b>\n"
             f"🟢 Server: <b>ONLINE</b> (Port {PORT})\n"
             f"⚙️ State: <b>{_esc(status).upper()}</b> | Phase: <b>{_esc(phase)}</b>\n"
-            f"🛡️ Mode: <b>{mode_str}</b>\n"
+            f"🛡️ Mode: <b>{mode_str}</b> | Broker: <b>{broker_str}</b>\n"
             f"{spot_header} | Lots: <b>{lots}</b>\n\n"
             f"💰 Position P&L: <b>{pos_sign}{pos_pts:.2f} pts</b> ({pos_sign}₹{pos_rs:,.2f})\n"
             f"💼 Day Total P&L: <b>{tot_sign}{tot_pts:.2f} pts</b> ({tot_sign}₹{tot_rs:,.2f})\n\n"
@@ -330,16 +332,17 @@ class TelegramSupervisor:
 
     def _cmd_pnl(self) -> None:
         st = self.get_server_status()
-        if not st:
-            self.send_message("🔴 Server is offline. Start it with /start_server.")
-            return
+        is_offline = not st
 
-        spot = st.get("spot")
-        atm = st.get("atm")
+        spot = st.get("spot") if st else None
+        atm = st.get("atm") if st else None
         spot_str = f"{spot:,.2f}" if spot else "—"
         atm_str = str(atm) if atm else "—"
 
         stats = compute_session_stats(st)
+        if is_offline and stats.get("realized_pts") == 0.0 and stats.get("realized_rs") == 0.0 and not stats.get("entries_today"):
+            self.send_message("🔴 <b>Server is offline and no trades were recorded in today's journal.</b>\nStart the server with <code>/start_server</code>.")
+            return
         tot_pts = stats["total_pts"]
         tot_rs = stats["total_rs"]
         tot_sign = "+" if tot_pts >= 0 else ""
@@ -371,19 +374,20 @@ class TelegramSupervisor:
 
     def _cmd_positions(self) -> None:
         st = self.get_server_status()
-        if not st:
-            self.send_message("🔴 Server is offline. Start it with /start_server.")
-            return
+        is_offline = not st
 
-        spot = st.get("spot")
-        atm = st.get("atm")
+        spot = st.get("spot") if st else None
+        atm = st.get("atm") if st else None
         spot_str = f"{spot:,.2f}" if spot else "—"
         atm_str = str(atm) if atm else "—"
 
         stats = compute_session_stats(st)
         legs = stats.get("legs", {})
         if not legs:
-            self.send_message("ℹ️ No active positions currently open.")
+            if is_offline:
+                self.send_message("🔴 Server is offline and no active or recorded positions were found in today's journal.")
+            else:
+                self.send_message("ℹ️ No active positions currently open.")
             return
 
         spot_header = format_spot_line(stats, atm)

@@ -39,6 +39,15 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app_inst: FastAPI):
+    # Restore broker session automatically from persistent .env credentials
+    if settings.has_credentials and not client.session_ok:
+        try:
+            client.connect()
+            if client.session_ok:
+                log.info("Broker session restored on server startup.")
+        except Exception as e:
+            log.warning("Broker session could not be restored on startup: %s", e)
+
     from app.telegram_bot import telegram_bot
     telegram_bot.init(
         state=_state,

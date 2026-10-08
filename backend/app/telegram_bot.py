@@ -619,9 +619,11 @@ class TelegramCommandPoller:
         atm = st.get("atm")
         paper = st.get("paper_mode", True)
         armed = st.get("live_armed", False)
+        session_ok = bool(st.get("session_ok"))
         lots = st.get("lots", 1)
 
         mode_str = "PAPER" if paper else ("LIVE (ARMED)" if armed else "LIVE (DISARMED)")
+        broker_str = "🟢 CONNECTED" if session_ok else "🔴 OFFLINE (/login)"
         spot_str = f"{spot:,.2f}" if spot else "N/A"
         atm_str = str(atm) if atm else "N/A"
 
@@ -637,7 +639,7 @@ class TelegramCommandPoller:
         msg = (
             "📊 <b>Bot Status Overview</b>\n"
             f"⚙️ State: <b>{_esc(status).upper()}</b> | Phase: <b>{_esc(phase)}</b>\n"
-            f"🛡️ Mode: <b>{mode_str}</b>\n"
+            f"🛡️ Mode: <b>{mode_str}</b> | Broker: <b>{broker_str}</b>\n"
             f"{spot_header} | Lots: <b>{lots}</b>\n\n"
             f"💰 Position P&L: <b>{pos_sign}{pos_pts:.2f} pts</b> ({pos_sign}₹{pos_rs:,.2f})\n"
             f"💼 Day Total P&L: <b>{tot_sign}{tot_pts:.2f} pts</b> ({tot_sign}₹{tot_rs:,.2f})\n\n"

@@ -320,3 +320,56 @@ def test_session_state_listeners():
     st.remove_listener(callback)
     st.update(status="running")
     assert len(received) == 2
+
+
+def test_compute_session_stats_journal_eod_fallback():
+    from app.telegram_pnl import compute_session_stats
+
+    # Simulated post-EOD or restart state: status="done", no fills in memory, daily_pnl_pts=0
+    eod_state = {
+        "status": "done",
+        "day": "2026-10-07",
+        "live_mode": True,
+        "lots": 1,
+        "lot_size": 65,
+        "fills": [],
+        "legs": {"CE": {"is_open": False, "entry": None}, "PE": {"is_open": False, "entry": None}},
+        "risk": {"daily_pnl_pts": 0.0, "daily_pnl_rupees": 0.0, "entries_today": 0},
+    }
+
+    mock_journal_stats = {
+        "day": "2026-10-07",
+        "realized_pts": 4.88,
+        "realized_rs": 317.5,
+        "open_pts": 0.0,
+        "open_rs": 0.0,
+        "total_pts": 4.88,
+        "total_rs": 317.5,
+        "gross_pts": 13.5,
+        "costs_inr": 560.0,
+        "lot_size": 65,
+        "lots": 1,
+        "qty": 65,
+        "entries_today": 7,
+        "entry_spot": 22603.05,
+        "live_spot": 22603.05,
+        "legs": {
+            "CE": {"right": "CE", "symbol": "NIFTY_CE", "is_open": False, "pnl_pts": 28.28, "pnl_rupees": 1838.5},
+            "PE": {"right": "PE", "symbol": "NIFTY_PE", "is_open": False, "pnl_pts": -23.07, "pnl_rupees": -1499.25},
+        },
+    }
+
+    with patch("app.telegram_pnl.load_journal_day_stats", return_value=mock_journal_stats):
+        stats = compute_session_stats(eod_state)
+        assert stats["realized_pts"] == 4.88
+        assert stats["realized_rs"] == 317.5
+        assert stats["total_pts"] == 4.88
+        assert stats["total_rs"] == 317.5
+        assert stats["entries_today"] == 7
+        assert stats["legs"]["CE"]["symbol"] == "NIFTY_CE"
+
+        # Also verify None/offline state loads journal stats
+        stats_none = compute_session_stats(None)
+        assert stats_none["total_rs"] == 317.5
+        assert stats_none["entries_today"] == 7
+
