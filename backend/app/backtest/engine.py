@@ -77,9 +77,15 @@ def backtest_one_day(
         legs[right] = {"leg": leg, "df": df}
 
     day_start = pd.Timestamp(day_str)
-    timeline = legs["CE"]["df"].index[legs["CE"]["df"].index >= day_start].union(
-        legs["PE"]["df"].index[legs["PE"]["df"].index >= day_start]
-    )
+    for right, box in legs.items():
+        df = box["df"]
+        start_idx = df.index.searchsorted(day_start)
+        sub_idx = df.index[start_idx:]
+        vals = df.iloc[start_idx:][["open", "high", "low", "close"]].to_numpy()
+        box["bars"] = {t: tuple(row) for t, row in zip(sub_idx, vals)}
+        box["times"] = sub_idx
+
+    timeline = legs["CE"]["times"].union(legs["PE"]["times"])
     timeline = timeline[timeline >= entry_dt]
     if timeline.empty:
         return None
@@ -97,61 +103,71 @@ def backtest_one_day(
             comb_sl = round(sum(entries) + comb_pts, 2)
 
     exits = []
+    has_comb = comb_sl is not None
+    has_sl_cost = p.sl_to_cost
+    ce_box = legs["CE"]
+    pe_box = legs["PE"]
+    ce_leg, ce_bars = ce_box["leg"], ce_box["bars"]
+    pe_leg, pe_bars = pe_box["leg"], pe_box["bars"]
+
     for ts in timeline:
         if ts >= so_dt:
             reason = SQUAREOFF if p.expiry_mode == "EOD" else HOLD_TO_EXPIRY
-            for right, box in legs.items():
-                leg, df = box["leg"], box["df"]
-                if leg.is_open:
-                    px = (
-                        _clean_price(df.loc[ts, "open"], leg.last_close)
-                        if ts in df.index
-                        else leg.last_close
-                    )
-                    exits.append((right, ts, px, reason))
-                    leg.is_open = False
+            if ce_leg.is_open:
+                b = ce_bars.get(ts)
+                px = _clean_price(b[0], ce_leg.last_close) if b else ce_leg.last_close
+                exits.append(("CE", ts, px, reason))
+                ce_leg.is_open = False
+            if pe_leg.is_open:
+                b = pe_bars.get(ts)
+                px = _clean_price(b[0], pe_leg.last_close) if b else pe_leg.last_close
+                exits.append(("PE", ts, px, reason))
+                pe_leg.is_open = False
             break
 
-        if comb_sl is not None and any(box["leg"].is_open for box in legs.values()):
-            tot_high = sum(
-                (
-                    _clean_price(box["df"].loc[ts, "high"], box["leg"].last_close)
-                    if ts in box["df"].index
-                    else box["leg"].last_close
-                )
-                for right, box in legs.items()
+        if has_comb and (ce_leg.is_open or pe_leg.is_open):
+            ce_b = ce_bars.get(ts)
+            pe_b = pe_bars.get(ts)
+            tot_high = (_clean_price(ce_b[1], ce_leg.last_close) if ce_b else ce_leg.last_close) + (
+                _clean_price(pe_b[1], pe_leg.last_close) if pe_b else pe_leg.last_close
+            )
+            tot_open = (_clean_price(ce_b[0], ce_leg.last_close) if ce_b else ce_leg.last_close) + (
+                _clean_price(pe_b[0], pe_leg.last_close) if pe_b else pe_leg.last_close
             )
             if tot_high >= comb_sl:
-                tot_open = sum(
-                    (
-                        _clean_price(box["df"].loc[ts, "open"], box["leg"].last_close)
-                        if ts in box["df"].index
-                        else box["leg"].last_close
-                    )
-                    for right, box in legs.items()
-                )
-                for right, box in legs.items():
-                    leg, df = box["leg"], box["df"]
-                    if leg.is_open:
-                        open_px = _clean_price(df.loc[ts, "open"], leg.last_close) if ts in df.index else leg.last_close
-                        high_px = _clean_price(df.loc[ts, "high"], leg.last_close) if ts in df.index else leg.last_close
-                        px = open_px if tot_open >= comb_sl else high_px
-                        exits.append((right, ts, px, COMBINED_SL))
-                        leg.is_open = False
+                if ce_leg.is_open:
+                    open_px = _clean_price(ce_b[0], ce_leg.last_close) if ce_b else ce_leg.last_close
+                    high_px = _clean_price(ce_b[1], ce_leg.last_close) if ce_b else ce_leg.last_close
+                    px = open_px if tot_open >= comb_sl else high_px
+                    exits.append(("CE", ts, px, COMBINED_SL))
+                    ce_leg.is_open = False
+                if pe_leg.is_open:
+                    open_px = _clean_price(pe_b[0], pe_leg.last_close) if pe_b else pe_leg.last_close
+                    high_px = _clean_price(pe_b[1], pe_leg.last_close) if pe_b else pe_leg.last_close
+                    px = open_px if tot_open >= comb_sl else high_px
+                    exits.append(("PE", ts, px, COMBINED_SL))
+                    pe_leg.is_open = False
                 break
 
+        if ce_leg.is_open:
+            b = ce_bars.get(ts)
+            if b:
+                res = ce_leg.on_bar(Bar(open=b[0], high=b[1], low=b[2], close=b[3]))
+                if res:
+                    exits.append(("CE", ts, res[1], res[0]))
+                    if res[0] == SL and has_sl_cost:
+                        if pe_leg.is_open and pe_leg.entry is not None:
+                            pe_leg.sl_level = pe_leg.entry
 
-        for right, box in legs.items():
-            leg, df = box["leg"], box["df"]
-            if not leg.is_open or ts not in df.index:
-                continue
-            res = leg.on_bar(Bar.from_row(df.loc[ts]))
-            if res:
-                exits.append((right, ts, res[1], res[0]))
-                if res[0] == SL and p.sl_to_cost:
-                    for other_right, other_box in legs.items():
-                        if other_box["leg"].is_open and other_box["leg"].entry is not None:
-                            other_box["leg"].sl_level = other_box["leg"].entry
+        if pe_leg.is_open:
+            b = pe_bars.get(ts)
+            if b:
+                res = pe_leg.on_bar(Bar(open=b[0], high=b[1], low=b[2], close=b[3]))
+                if res:
+                    exits.append(("PE", ts, res[1], res[0]))
+                    if res[0] == SL and has_sl_cost:
+                        if ce_leg.is_open and ce_leg.entry is not None:
+                            ce_leg.sl_level = ce_leg.entry
 
     for right, box in legs.items():
         leg = box["leg"]
