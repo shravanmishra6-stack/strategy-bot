@@ -18,10 +18,10 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 
 from app.broker.noren_client import client
-from app.config import settings, update_access_token
+from app.config import settings, update_access_token, update_paper_mode
 from app import journal as journal_mod
 from app.session import SessionState, run_day
-from scripts.oauth_login import exchange_and_save, _make_api
+from scripts.oauth_login import exchange_and_save, _make_api, _write_env_values
 from pydantic import BaseModel
 from typing import Optional
 
@@ -221,6 +221,7 @@ class ConfigUpdateReq(BaseModel):
     strategy_type: Optional[str] = None  # "straddle" | "strangle"
     entry_time: Optional[str] = None     # "HH:MM"
     squareoff_time: Optional[str] = None # "HH:MM"
+    paper_mode: Optional[bool] = None
 
 
 @app.post("/api/config")
@@ -232,6 +233,21 @@ def update_config(req: ConfigUpdateReq) -> JSONResponse:
     and strategy type are noted for next start.
     """
     changes = {}
+    if req.paper_mode is not None:
+        if _thread and _thread.is_alive():
+            return JSONResponse(
+                {"ok": False, "reason": "Cannot toggle paper mode while session is running"},
+                status_code=400)
+        update_paper_mode(req.paper_mode)
+        try:
+            _write_env_values({"PAPER_MODE": "true" if req.paper_mode else "false"})
+        except Exception as e:
+            log.warning("Could not persist PAPER_MODE to .env: %s", e)
+        if req.paper_mode and client.live_armed:
+            client.disarm_live_trading()
+            _state.update(live_armed=False)
+        changes["paper_mode"] = req.paper_mode
+
     if req.lots is not None:
         if req.lots < 1 or req.lots > settings.max_lots:
             return JSONResponse(
@@ -297,7 +313,9 @@ def update_config(req: ConfigUpdateReq) -> JSONResponse:
     log.info("Runtime config updated: %s", changes)
     _save_overrides()
     return JSONResponse({"ok": True, "changes": changes,
-                         "overrides": dict(runtime_overrides)})
+                         "overrides": dict(runtime_overrides),
+                         "paper_mode": settings.paper_mode})
+
 
 
 @app.get("/api/journal")

@@ -88,6 +88,7 @@
     background: rgba(255,255,255,0.04);
     transition: all 0.2s ease;
   }
+  #mode { cursor: pointer; user-select: none; }
   .live {
     background: var(--bad-bg);
     color: var(--bad);
@@ -632,6 +633,13 @@
   <!-- Strategy Rules Card -->
   <div class="card">
     <h2>Strategy Rules</h2>
+    <div class="form-row">
+      <label for="cfg-paper">Trading Mode</label>
+      <div class="type-pills" id="cfg-mode-pills">
+        <button id="cfg-mode-paper" class="active" data-val="paper">🛡 Paper</button>
+        <button id="cfg-mode-live" data-val="live">⚡ Live</button>
+      </div>
+    </div>
     <div class="form-row">
       <label for="cfg-type">Strategy Type</label>
       <div class="type-pills" id="cfg-type-pills">

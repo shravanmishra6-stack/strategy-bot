@@ -273,4 +273,9 @@ def update_access_token(token: str, uid: str = "", account_id: str = "") -> None
     if account_id:
         object.__setattr__(settings, "account_id", account_id)
 
+
+def update_paper_mode(paper_mode: bool) -> None:
+    """Dynamically update paper_mode on singleton settings without restarting."""
+    object.__setattr__(settings, "paper_mode", bool(paper_mode))
+
 settings = Settings()

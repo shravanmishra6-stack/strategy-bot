@@ -159,6 +159,7 @@ async function refresh(){
 
     $('mode').textContent = s.paper_mode ? 'PAPER MODE' : 'LIVE MODE';
     $('mode').className = 'pill ' + (s.paper_mode ? 'paper' : 'live');
+    $('mode').title = 'Current trading mode: ' + (s.paper_mode ? 'Paper (simulated)' : 'Live (real money)') + '. Click to switch.';
     $('armed').textContent = s.live_armed ? 'ARMED' : 'disarmed';
     $('armed').className = 'pill ' + (s.live_armed ? 'live' : '');
     $('conn').textContent = 'broker: ' + (s.session_ok ? 'connected' : 'offline');
@@ -378,6 +379,11 @@ async function refresh(){
       $('cfg-offset-row').style.display = isStrangle ? 'flex' : 'none';
       if (isStrangle && sp.strike_offset) $('cfg-offset').value = sp.strike_offset;
 
+      // Trading mode pills (Paper vs Live)
+      const isPaper = !!s.paper_mode;
+      $('cfg-mode-paper').className = isPaper ? 'active' : '';
+      $('cfg-mode-live').className = isPaper ? '' : 'active';
+
       configSynced = true;
     }
 
@@ -407,6 +413,35 @@ $('b-arm').onclick     = () => {
     post('/api/arm');
 };
 $('b-disarm').onclick  = () => post('/api/disarm');
+
+// Click header mode badge to toggle Paper vs Live mode quickly
+$('mode').onclick = async () => {
+  const currentText = $('mode').textContent || '';
+  const currentlyPaper = currentText.includes('PAPER');
+  const targetMode = currentlyPaper ? 'LIVE (Real Money)' : 'PAPER (Simulated)';
+  const confirmMsg = currentlyPaper
+    ? 'SWITCH TO LIVE TRADING MODE?\n\nReal orders will be allowed (after manual ARM). Are you sure?'
+    : 'Switch back to PAPER TRADING mode?\n\nOrders will be simulated locally. Zero real money risk.';
+  if (!confirm(confirmMsg)) return;
+
+  try {
+    const res = await fetch('/api/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({paper_mode: !currentlyPaper})
+    });
+    const data = await res.json();
+    if (res.ok) {
+      $('msg').textContent = '✓ Switched trading mode to ' + targetMode;
+      configDirty = false;
+      refresh();
+    } else {
+      $('msg').textContent = '⚠ ' + (data.reason || 'Mode switch failed');
+    }
+  } catch(e) {
+    $('msg').textContent = '⚠ ' + e.message;
+  }
+};
 
 $('b-server-restart').onclick = async () => {
   if (!confirm('Restart Python / Uvicorn server process now?\n\nThis will terminate the current process and launch a fresh server with the latest code.')) return;
@@ -545,6 +580,18 @@ for (const id of ['cfg-lots','cfg-sl','cfg-combsl','cfg-target','cfg-offset','cf
 }
 $('cfg-sltocost').addEventListener('change', () => { configDirty = true; });
 
+// Trading mode pill toggle (Paper vs Live)
+$('cfg-mode-paper').onclick = () => {
+  $('cfg-mode-paper').className = 'active';
+  $('cfg-mode-live').className = '';
+  configDirty = true;
+};
+$('cfg-mode-live').onclick = () => {
+  $('cfg-mode-live').className = 'active';
+  $('cfg-mode-paper').className = '';
+  configDirty = true;
+};
+
 // Straddle / Strangle pill toggle
 $('cfg-type-straddle').onclick = () => {
   $('cfg-type-straddle').className = 'active';
@@ -562,7 +609,9 @@ $('cfg-type-strangle').onclick = () => {
 // Apply config button
 $('b-apply-config').onclick = async () => {
   const isStrangle = $('cfg-type-strangle').classList.contains('active');
+  const isPaper = $('cfg-mode-paper').classList.contains('active');
   const body = {
+    paper_mode: isPaper,
     lots: parseInt($('cfg-lots').value) || 1,
     sl_pct: (parseInt($('cfg-sl').value) || 0) / 100,
     combined_sl_pct: (parseInt($('cfg-combsl').value) || 0) / 100,

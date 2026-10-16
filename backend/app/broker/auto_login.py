@@ -104,9 +104,30 @@ def perform_auto_login() -> Dict[str, Any]:
     with sync_playwright() as p:
         browser = None
         # Try available system browsers: Edge (built into Windows), Chrome, then bundled Chromium
+        common_args = [
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-breakpad",
+            "--disable-component-extensions-with-background-pages",
+            "--disable-extensions",
+            "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter",
+            "--disable-ipc-flooding-protection",
+            "--disable-renderer-backgrounding",
+            "--metrics-recording-only",
+            "--mute-audio",
+            "--no-first-run",
+        ]
         for channel in ("msedge", "chrome", None):
             try:
-                launch_kwargs: Dict[str, Any] = {"headless": True}
+                launch_kwargs: Dict[str, Any] = {
+                    "headless": True,
+                    "args": common_args,
+                }
                 if channel:
                     launch_kwargs["channel"] = channel
                 browser = p.chromium.launch(**launch_kwargs)
@@ -121,6 +142,16 @@ def perform_auto_login() -> Dict[str, Any]:
         context = browser.new_context()
         page = context.new_page()
 
+        # Abort heavy assets (images, fonts, media, stylesheets unnecessary for login form)
+        def _route_handler(route):
+            req = route.request
+            if req.resource_type in ("image", "media", "font"):
+                route.abort()
+            else:
+                route.continue_()
+
+        page.route("**/*", _route_handler)
+
         def _on_request(request):
             nonlocal captured_code
             code = _extract_code(request.url)
@@ -130,7 +161,7 @@ def perform_auto_login() -> Dict[str, Any]:
         page.on("request", _on_request)
 
         try:
-            page.goto(auth_url, wait_until="networkidle", timeout=30000)
+            page.goto(auth_url, wait_until="domcontentloaded", timeout=30000)
 
             # Check if current URL already has code
             captured_code = captured_code or _extract_code(page.url)
